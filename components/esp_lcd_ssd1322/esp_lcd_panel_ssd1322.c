@@ -194,6 +194,8 @@ static esp_err_t panel_ssd1322_init(esp_lcd_panel_t *panel) {
     //   0xB5 0x00      Set GPIO <- not a no-op, but unwanted
     //   0xAF           Display ON
 
+    ESP_LOGD(TAG, "panel init");
+
     ESP_RETURN_ON_ERROR(
         esp_lcd_panel_io_tx_param(
             io, SSD1322_SET_DISPLAY_CLOCK_DIVIDER,
@@ -287,6 +289,7 @@ static esp_err_t panel_ssd1322_init(esp_lcd_panel_t *panel) {
             uint8_t right = regions[i + 1];
             uint8_t top = regions[i + 2];
             uint8_t bottom = regions[i + 3];
+            ESP_LOGD(TAG, "Clearing region [%d-%d, %d-%d]", left, right, top, bottom);
 
             size_t count = (((right - left) + 1) * 2) * ((bottom - top) + 1);
             assert(count <= SCREEN_BUFFER_SIZE);
@@ -322,6 +325,34 @@ static esp_err_t panel_ssd1322_init(esp_lcd_panel_t *panel) {
         }
     }
 
+    ESP_RETURN_ON_ERROR(
+        esp_lcd_panel_io_tx_param(
+            io, SSD1322_SET_COLUMN_ADDRESS,
+            (uint8_t[]){
+                // The left and right screen extents.
+                0x1C,
+                0x5B,
+            },
+            2
+        ),
+        TAG, "io tx param SSD1322_SET_COLUMN_ADDRESS failed"
+    );
+
+    ESP_RETURN_ON_ERROR(
+        esp_lcd_panel_io_tx_param(
+            io, SSD1322_SET_ROW_ADDRESS,
+            (uint8_t[]){
+                // The top and bottom screen extents.
+                0x00,
+                0x3F,
+            },
+            2
+        ),
+        TAG, "io tx param SSD1322_SET_ROW_ADDRESS failed"
+    );
+
+    ESP_LOGD(TAG, "panel init done, waking from sleep");
+
     // After reset, the display is asleep in normal display mode with random data in the buffer.
     // Match built-in esp_lcd drivers by blanking the display and waking it from sleep.
     // The user will be able to set an image before calling esp_lcd_panel_disp_on_off, which will complete instantly,
@@ -356,32 +387,6 @@ static esp_err_t panel_ssd1322_draw_bitmap(
     // TODO: Only flush the dirty region rather than the full buffer.
     // TODO: That's actually quite complex without esp_lcd_panel_io_tx_color supporting a stride.
     //       As a middle ground, we could at least only flush full rows.
-
-    ESP_RETURN_ON_ERROR(
-        esp_lcd_panel_io_tx_param(
-            io, SSD1322_SET_COLUMN_ADDRESS,
-            (uint8_t[]){
-                // The left and right screen extents.
-                0x1C,
-                0x5B,
-            },
-            2
-        ),
-        TAG, "io tx param SSD1322_SET_COLUMN_ADDRESS failed"
-    );
-
-    ESP_RETURN_ON_ERROR(
-        esp_lcd_panel_io_tx_param(
-            io, SSD1322_SET_ROW_ADDRESS,
-            (uint8_t[]){
-                // The top and bottom screen extents.
-                0x00,
-                0x3F,
-            },
-            2
-        ),
-        TAG, "io tx param SSD1322_SET_ROW_ADDRESS failed"
-    );
 
     ESP_RETURN_ON_ERROR(
         esp_lcd_panel_io_tx_color(io, SSD1322_WRITE_RAM, ssd1322->screen_buffer, SCREEN_BUFFER_SIZE), TAG,
