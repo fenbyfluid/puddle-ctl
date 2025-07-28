@@ -15,6 +15,8 @@
 #define IS31FL3746A_ADDR2_SDA 0b1101000
 #define IS31FL3746A_ADDR2_VCC 0b1101100
 
+#define IS31FL3746A_LED_COUNT 24
+
 #ifdef __cplusplus
 extern "C" {
 #endif

@@ -22,13 +22,13 @@
 
 static const char *TAG = "IS31FL3746A";
 
-static const uint8_t LED_MAP[24] = {
+static const uint8_t LED_MAP[IS31FL3746A_LED_COUNT] = {
     0,  6, 12, 18,  1,  7, 13, 19,
     2,  8, 14, 20,  3,  9, 15, 21,
     4, 10, 16, 22,  5, 11, 17, 23,
 };
 
-#define LED_BUFFER_SIZE (24 * 3)
+#define LED_BUFFER_SIZE (IS31FL3746A_LED_COUNT * 3)
 
 typedef struct {
     uint32_t xfer_timeout_ms;
@@ -179,7 +179,7 @@ esp_err_t is31fl3746a_set_global_scale(is31fl3746a_handle_t handle, uint8_t scal
 }
 
 esp_err_t is31fl3746a_set_led_helper(uint8_t *buffer, uint8_t *range, uint8_t led_index, uint8_t r, uint8_t g, uint8_t b) {
-    if (led_index >= 24) {
+    if (led_index >= IS31FL3746A_LED_COUNT) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -229,7 +229,7 @@ esp_err_t is31fl3746a_flush_led_helper(is31fl3746a_handle_t handle, uint8_t bank
         return ESP_OK;
     }
 
-    assert(range[0] < 24 && range[1] < 24);
+    assert(range[0] < IS31FL3746A_LED_COUNT && range[1] < IS31FL3746A_LED_COUNT);
     assert(range[0] <= range[1]);
 
     is31fl3746a_dev_t *device = (is31fl3746a_dev_t *)handle;

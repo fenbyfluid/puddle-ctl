@@ -29,6 +29,9 @@
 #define OLED_SPI_CLOCK_SPEED (8 * 1000 * 1000) // We should be able to go up to 10 MHz - according to Logic, 10 oscillates between 8 and 12
 #define OLED_SPI_HOST SPI2_HOST
 
+#define MAX_DISPLAY_COUNT 2
+#define MAX_ENCODER_COUNT 4
+
 const gpio_num_t STEMMA_QT_PWR_GPIO = 7;
 const gpio_num_t ONBOARD_LED_GPIO = 13;
 const gpio_num_t I2C_SDA_GPIO = 3;
@@ -78,132 +81,137 @@ static void lvgl_flush_callback(lv_display_t *disp, const lv_area_t *area, uint8
     lv_display_flush_ready(disp);
 }
 
-atomic_int_fast8_t encoder_values[1] = {0};
+atomic_int_fast8_t encoder_values[MAX_ENCODER_COUNT] = {0};
 
 void update_display_timer(lv_timer_t *timer) {
     lv_obj_t **labels = (lv_obj_t **)lv_timer_get_user_data(timer);
 
-    lv_label_set_text_fmt(labels[0], "%d", encoder_values[0]);
+    for (int i = 0; i < MAX_ENCODER_COUNT; i++) {
+        lv_label_set_text_fmt(labels[i], "%d", encoder_values[i]);
+    }
 
     lv_timer_reset(timer);
 }
 
-void run_display_tests(void *pvParameters) {
-    // Display tests.
-    esp_lcd_panel_io_handle_t io_handle_left = NULL;
-    esp_lcd_panel_handle_t panel_handle_left = NULL;
-    esp_lcd_panel_io_handle_t io_handle_right = NULL;
-    esp_lcd_panel_handle_t panel_handle_right = NULL;
+lv_obj_t *create_label_with_container(lv_obj_t *parent, lv_align_t alignment) {
+    lv_obj_t *container = lv_obj_create(parent);
+    lv_obj_set_size(container, lv_pct(50), lv_pct(100));
+    lv_obj_set_style_bg_color(container, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_border_width(container, 0, LV_PART_MAIN);
+    lv_obj_align(container, alignment, 0, 0);
 
-    {
-        spi_bus_config_t buscfg = {
-            .sclk_io_num = SPI_SCLK_GPIO,
-            .mosi_io_num = SPI_MOSI_GPIO,
-            .miso_io_num = -1,
-            .quadwp_io_num = -1,
-            .quadhd_io_num = -1,
-            .max_transfer_sz = 128 * 64, // TODO: Absolute guess - one screen's worth
-        };
-        ESP_ERROR_CHECK(spi_bus_initialize(OLED_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO)); // Enable the DMA feature
+    lv_obj_t *label = lv_label_create(container);
+    lv_label_set_text(label, "");
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
 
-        esp_lcd_panel_io_spi_config_t io_config = {
-            .dc_gpio_num = OLED_DC_GPIO,
-            .cs_gpio_num = OLED_LEFT_CS_GPIO,
-            .pclk_hz = OLED_SPI_CLOCK_SPEED,
-            .lcd_cmd_bits = 8,
-            .lcd_param_bits = 8,
-            .spi_mode = 3,
-            .trans_queue_depth = 10,
-            .cs_ena_pretrans = 1,
-            .cs_ena_posttrans = 1,
-        };
+    return label;
+}
 
-        // Attach the LCD to the SPI bus
-        ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)OLED_SPI_HOST, &io_config, &io_handle_left));
+void display_task_main(void *pvParameters) {
+    esp_lcd_panel_io_handle_t io_handle[MAX_DISPLAY_COUNT] = {NULL, NULL};
+    esp_lcd_panel_handle_t panel_handle[MAX_DISPLAY_COUNT] = {NULL, NULL};
 
-        io_config.cs_gpio_num = OLED_RIGHT_CS_GPIO;
-        ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)OLED_SPI_HOST, &io_config, &io_handle_right));
+    spi_bus_config_t buscfg = {
+        .sclk_io_num = SPI_SCLK_GPIO,
+        .mosi_io_num = SPI_MOSI_GPIO,
+        .miso_io_num = -1,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = SSD1322_PANEL_WIDTH * SSD1322_PANEL_HEIGHT,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(OLED_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
-        esp_lcd_panel_dev_config_t panel_config = {
-            .reset_gpio_num = OLED_RESET_GPIO,
-            .bits_per_pixel = 8,
-        };
+    esp_lcd_panel_io_spi_config_t io_config = {
+        .dc_gpio_num = OLED_DC_GPIO,
+        .cs_gpio_num = OLED_LEFT_CS_GPIO,
+        .pclk_hz = OLED_SPI_CLOCK_SPEED,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+        .spi_mode = 3,
+        .trans_queue_depth = 10,
+        .cs_ena_pretrans = 1,
+        .cs_ena_posttrans = 1,
+    };
 
-        // Create LCD panel handle for SSD1322, with the SPI IO device handle
-        ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1322(io_handle_left, &panel_config, &panel_handle_left));
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)OLED_SPI_HOST, &io_config, &io_handle[0]));
 
-        // The reset lines are joined together, so resetting one resets them both.
-        panel_config.reset_gpio_num = -1;
-        ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1322(io_handle_right, &panel_config, &panel_handle_right));
+    io_config.cs_gpio_num = OLED_RIGHT_CS_GPIO;
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)OLED_SPI_HOST, &io_config, &io_handle[1]));
+
+    esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = OLED_RESET_GPIO,
+        .bits_per_pixel = 8,
+    };
+
+    ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1322(io_handle[0], &panel_config, &panel_handle[0]));
+
+    // The reset lines are joined together, so resetting one resets them both.
+    panel_config.reset_gpio_num = -1;
+    ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1322(io_handle[1], &panel_config, &panel_handle[1]));
+
+    // Wait for power to stabilize
+    // We need to wait at least 1ms before reset, but 300ms before init
+    // Reset itself waits 200ms, so we wait an extra 100ms to make up the difference
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    for (int i = 0; i < MAX_DISPLAY_COUNT; i++) {
+        ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle[i]));
+        ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle[i]));
     }
 
-    {
-        // Wait for power to stabilize
-        // We need to wait at least 1ms before reset, but 300ms before init
-        // Reset itself waits 200ms, so we wait an extra 100ms to make up the difference
-        vTaskDelay(pdMS_TO_TICKS(100));
+    lv_obj_t *screen[MAX_DISPLAY_COUNT] = {NULL, NULL};
 
-        // The reset for the right panel is a no-op, see above.
-        ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle_left));
-        ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle_right));
+    ESP_LOGI(TAG, "Initialize LVGL library");
+    lv_init();
 
-        ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle_left));
-        ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle_right));
-    }
+    lv_tick_set_cb(lvgl_tick_callback);
 
-    lv_obj_t *screen_left = NULL;
-
-    {
-        ESP_LOGI(TAG, "Initialize LVGL library");
-        lv_init();
-
-        lv_tick_set_cb(lvgl_tick_callback);
-
-        lv_display_t *display_left = lv_display_create(SSD1322_PANEL_WIDTH, SSD1322_PANEL_HEIGHT);
+    for (int i = 0; i < MAX_DISPLAY_COUNT; i++) {
+        lv_display_t *display = lv_display_create(SSD1322_PANEL_WIDTH, SSD1322_PANEL_HEIGHT);
 
         size_t draw_buffer_sz = SSD1322_PANEL_WIDTH * SSD1322_PANEL_HEIGHT;
-        void *draw_buffer_left = calloc(1, draw_buffer_sz);
-        lv_display_set_buffers(display_left, draw_buffer_left, NULL, draw_buffer_sz, LV_DISPLAY_RENDER_MODE_PARTIAL);
+        void *draw_buffer = calloc(1, draw_buffer_sz);
+        lv_display_set_buffers(display, draw_buffer, NULL, draw_buffer_sz, LV_DISPLAY_RENDER_MODE_PARTIAL);
 
-        lv_display_set_color_format(display_left, LV_COLOR_FORMAT_L8);
-        lv_display_set_user_data(display_left, panel_handle_left);
-        lv_display_set_flush_cb(display_left, lvgl_flush_callback);
+        lv_display_set_color_format(display, LV_COLOR_FORMAT_L8);
+        lv_display_set_user_data(display, panel_handle[i]);
+        lv_display_set_flush_cb(display, lvgl_flush_callback);
 
         // Use the draw buffer to clear the screen before turning it on.
-        ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel_handle_left, 0, 0, SSD1322_PANEL_WIDTH, SSD1322_PANEL_HEIGHT, draw_buffer_left));
-        ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle_left, true));
+        ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel_handle[i], 0, 0, SSD1322_PANEL_WIDTH, SSD1322_PANEL_HEIGHT, draw_buffer));
+        ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle[i], true));
 
-        screen_left = lv_display_get_screen_active(display_left);
+        screen[i] = lv_display_get_screen_active(display);
+
+        // White text on a black background
+        lv_obj_set_style_bg_color(screen[i], lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_set_style_text_color(screen[i], lv_color_hex(0xffffff), LV_PART_MAIN);
     }
 
-    {
-        lv_obj_set_style_bg_color(screen_left, lv_color_hex(0x000000), LV_PART_MAIN);
-        lv_obj_set_style_text_color(screen_left, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_t *labels[MAX_ENCODER_COUNT] = {NULL};
 
-        lv_obj_t *labels[1];
-        for (int i = 0; i < 1; i++) {
-            labels[i] = lv_label_create(screen_left);
-            lv_label_set_text(labels[i], "");
-            lv_obj_align(labels[i], LV_ALIGN_CENTER, 0, 0);
-        }
+    labels[0] = create_label_with_container(screen[0], LV_ALIGN_LEFT_MID);
+    labels[1] = create_label_with_container(screen[0], LV_ALIGN_RIGHT_MID);
+    labels[2] = create_label_with_container(screen[1], LV_ALIGN_LEFT_MID);
+    labels[3] = create_label_with_container(screen[1], LV_ALIGN_RIGHT_MID);
 
-        lv_timer_create(update_display_timer, 10, labels);
+    lv_timer_create(update_display_timer, 10, labels);
 
-        for (;;) {
-            uint32_t time_till_next = lv_timer_handler();
-            vTaskDelay(pdMS_TO_TICKS(time_till_next));
-        }
+    for (;;) {
+        uint32_t time_till_next = lv_timer_handler();
+        vTaskDelay(pdMS_TO_TICKS(time_till_next));
     }
 
-    {
-        ESP_ERROR_CHECK(esp_lcd_panel_disp_sleep(panel_handle_left, true));
-        ESP_ERROR_CHECK(esp_lcd_panel_disp_sleep(panel_handle_right, true));
+    for (int i = 0; i < MAX_DISPLAY_COUNT; i++) {
+        ESP_ERROR_CHECK(esp_lcd_panel_disp_sleep(panel_handle[i], true));
     }
+    
+    // TODO: De-init LVGL and remove the devices from the SPI bus
 
     vTaskDelete(NULL);
 }
 
-void run_i2c_tests(void *pvParameters) {
+void i2c_task_main(void *pvParameters) {
     i2c_master_bus_config_t i2c_mst_config = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .i2c_port = -1,
@@ -236,74 +244,72 @@ void run_i2c_tests(void *pvParameters) {
     int encoder_count = 1;
     if (i2c_master_probe(bus_handle, first_encoder, 100) == ESP_ERR_NOT_FOUND) {
         first_encoder = 0x44;
-        encoder_count = 4;
+        encoder_count = MAX_ENCODER_COUNT;
     }
+
     ESP_LOGI(TAG, "Detected first encoder at 0x%02X, count: %d", first_encoder, encoder_count);
 
-    /////////////////////
+    i2c_encoder_handle_t encoder_handles[MAX_ENCODER_COUNT] = {NULL};
+    for (int i = 0; i < encoder_count; ++i) {
+        ESP_ERROR_CHECK(i2c_encoder_create(bus_handle, first_encoder + i, I2C_CLOCK_SPEED, &encoder_handles[i]));
+        ESP_ERROR_CHECK(i2c_encoder_init(encoder_handles[i], false));
+        ESP_ERROR_CHECK(i2c_encoder_set_range(encoder_handles[i], 0, IS31FL3746A_LED_COUNT, 1));
+    }
 
     ESP_ERROR_CHECK(i2c_encoder_setup_interrupt(ENCODER_INTR_GPIO, true));
 
-    i2c_encoder_handle_t encoder_handle;
-    ESP_ERROR_CHECK(i2c_encoder_create(bus_handle, first_encoder, I2C_CLOCK_SPEED, &encoder_handle));
-
-    ESP_ERROR_CHECK(i2c_encoder_init(encoder_handle, false));
-
-    ESP_ERROR_CHECK(i2c_encoder_set_range(encoder_handle, 0, 24, 1));
-
-    uint8_t led_scale = 8;
-    ESP_ERROR_CHECK(i2c_encoder_set_led_color(encoder_handle, 0x7F / led_scale, 0xFF / led_scale, 0x7F / led_scale));
-
-    /////////////////////
-
-    is31fl3746a_handle_t ring_handle;
-    ESP_ERROR_CHECK(is31fl3746a_create(bus_handle, 0x60 | first_encoder, I2C_CLOCK_SPEED, &ring_handle));
-
-    ESP_ERROR_CHECK(is31fl3746a_init(ring_handle));
-
-    ESP_ERROR_CHECK(is31fl3746a_set_global_scale(ring_handle, 0x01));
-
-    for (uint8_t i = 0; i < 24; ++i) {
-        ESP_ERROR_CHECK(is31fl3746a_set_led_scale(ring_handle, i, 0xFF, 0x7F, 0x7F));
+    is31fl3746a_handle_t ring_handles[MAX_ENCODER_COUNT] = {NULL};
+    for (int i = 0; i < encoder_count; ++i) {
+        ESP_ERROR_CHECK(is31fl3746a_create(bus_handle, 0x60 | (first_encoder + i), I2C_CLOCK_SPEED, &ring_handles[i]));
+        ESP_ERROR_CHECK(is31fl3746a_init(ring_handles[i]));
+        ESP_ERROR_CHECK(is31fl3746a_set_global_scale(ring_handles[i], 0x01));
+        for (uint8_t j = 0; j < IS31FL3746A_LED_COUNT; ++j) {
+            ESP_ERROR_CHECK(is31fl3746a_set_led_scale(ring_handles[i], j, 0xFF, 0x7F, 0x7F));
+        }
+        ESP_ERROR_CHECK(is31fl3746a_flush_led_scale(ring_handles[i]));
     }
 
-    ESP_ERROR_CHECK(is31fl3746a_flush_led_scale(ring_handle));
-
-    /////////////////
+    for (int i = 0; i < encoder_count; ++i) {
+        uint8_t led_scale = 8;
+        ESP_ERROR_CHECK(i2c_encoder_set_led_color(encoder_handles[i], 0x7F / led_scale, 0xFF / led_scale, 0x7F / led_scale));
+    }
 
     for (;;) {
-        // ESP_ERROR_CHECK(i2c_encoder_poll_status(encoder_handle));
+        for (int i = 0; i < encoder_count; ++i) {
+            // ESP_ERROR_CHECK(i2c_encoder_poll_status(encoder_handles[i]));
 
-        int8_t value;
-        ESP_ERROR_CHECK(i2c_encoder_read_value(encoder_handle, &value));
-        
-        encoder_values[0] = value;
+            int8_t value;
+            ESP_ERROR_CHECK(i2c_encoder_read_value(encoder_handles[i], &value));
 
-        for (uint8_t i = 0; i < 24; ++i) {
-            if (value > i) {
-                ESP_ERROR_CHECK(is31fl3746a_set_led_color(ring_handle, i, 0xFF, 0xFF, 0xFF));
-            } else {
-                ESP_ERROR_CHECK(is31fl3746a_set_led_color(ring_handle, i, 0x00, 0x00, 0x00));
+            encoder_values[i] = value;
+
+            for (uint8_t j = 0; j < IS31FL3746A_LED_COUNT; ++j) {
+                if (value > j) {
+                    ESP_ERROR_CHECK(is31fl3746a_set_led_color(ring_handles[i], j, 0xFF, 0xFF, 0xFF));
+                } else {
+                    ESP_ERROR_CHECK(is31fl3746a_set_led_color(ring_handles[i], j, 0x00, 0x00, 0x00));
+                }
             }
-        }
 
-        ESP_ERROR_CHECK(is31fl3746a_flush_led_color(ring_handle));
+            ESP_ERROR_CHECK(is31fl3746a_flush_led_color(ring_handles[i]));
+        }
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    /////////////////
+    for (int i = 0; i < encoder_count; ++i) {
+        for (uint8_t j = 0; j < IS31FL3746A_LED_COUNT; ++j) {
+            ESP_ERROR_CHECK(is31fl3746a_set_led_color(ring_handles[i], j, 0x00, 0x00, 0x00));
+        }
 
-    for (uint8_t i = 0; i < 24; ++i) {
-        ESP_ERROR_CHECK(is31fl3746a_set_led_color(ring_handle, i, 0x00, 0x00, 0x00));
+        ESP_ERROR_CHECK(is31fl3746a_flush_led_color(ring_handles[i]));
+
+        ESP_ERROR_CHECK(i2c_encoder_set_led_color(encoder_handles[i], 0x00, 0x00, 0x00));
+
+        is31fl3746a_delete(ring_handles[i]);
+        i2c_encoder_delete(encoder_handles[i]);
     }
 
-    ESP_ERROR_CHECK(is31fl3746a_flush_led_color(ring_handle));
-
-    ESP_ERROR_CHECK(i2c_encoder_set_led_color(encoder_handle, 0x00, 0x00, 0x00));
-
-    is31fl3746a_delete(ring_handle);
-    i2c_encoder_delete(encoder_handle);
     i2c_del_master_bus(bus_handle);
 
     vTaskDelete(NULL);
@@ -326,43 +332,25 @@ void app_main(void) {
     //     vTaskDelay(pdMS_TO_TICKS(1000));
     // }
 
-    /* Print chip information */
-    esp_chip_info_t chip_info;
-    uint32_t flash_size;
-    esp_chip_info(&chip_info);
-    printf(
-        "This is %s chip with %d CPU core(s), %s%s%s%s, ", CONFIG_IDF_TARGET, chip_info.cores,
-        (chip_info.features & CHIP_FEATURE_WIFI_BGN) ? "WiFi/" : "", (chip_info.features & CHIP_FEATURE_BT) ? "BT" : "",
-        (chip_info.features & CHIP_FEATURE_BLE) ? "BLE" : "",
-        (chip_info.features & CHIP_FEATURE_IEEE802154) ? ", 802.15.4 (Zigbee/Thread)" : ""
-    );
-
-    unsigned major_rev = chip_info.revision / 100;
-    unsigned minor_rev = chip_info.revision % 100;
-    printf("silicon revision v%d.%d, ", major_rev, minor_rev);
-    if (esp_flash_get_size(NULL, &flash_size) != ESP_OK) {
-        printf("Get flash size failed");
-        return;
-    }
-
-    printf(
-        "%" PRIu32 "MB %s flash\n", flash_size / (uint32_t)(1024 * 1024),
-        (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded" : "external"
-    );
-
-    printf("Minimum free heap size: %" PRIu32 " bytes\n", esp_get_minimum_free_heap_size());
-
     // The on-board I2C pull-up resistors are tied to VSENSOR. Fortunately we can spare the current now.
     enable_stemma_power(true);
 
-    xTaskCreatePinnedToCore(run_display_tests, "OLEDTests", 8192, NULL, 10, NULL, xPortGetCoreID());
-    xTaskCreatePinnedToCore(run_i2c_tests, "I2CTests", 8192, NULL, 10, NULL, xPortGetCoreID());
+    xTaskCreatePinnedToCore(display_task_main, "OLED", 8192, NULL, 10, NULL, xPortGetCoreID());
+    xTaskCreatePinnedToCore(i2c_task_main, "I2C", 8192, NULL, 10, NULL, xPortGetCoreID());
 
-    // Don't do this ever for now, as we're getting reverse current flow that needs troubleshooting.
-    // TODO: We need to turn off the I2C and SPI interfaces before turning off the power.
-    // enable_stemma_power(false);
+    // Print heap memory usage statistics every 10 seconds
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
 
-    vTaskSuspend(NULL);
+        // Output heap memory usage statistics (total, free, percentage used, etc.)
+        size_t total_heap = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
+        size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+        size_t min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
+        float used_percent = 100.0f * (total_heap - free_heap) / total_heap;
+
+        ESP_LOGI(TAG, "Heap stats: Total = %u, Free = %u, Min Free = %u, Used = %.2f%%",
+            total_heap, free_heap, min_free_heap, used_percent);
+    }
 
     // printf("Restarting now.\n");
     // fflush(stdout);
