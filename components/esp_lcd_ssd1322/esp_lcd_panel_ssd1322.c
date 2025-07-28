@@ -2,6 +2,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "esp_lcd_panel_ssd1322.h"
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/cdefs.h>
@@ -19,7 +21,6 @@
 #include "esp_lcd_panel_interface.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
-#include "esp_lcd_panel_ssd1322.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -37,7 +38,7 @@ static esp_err_t panel_ssd1322_mirror(esp_lcd_panel_t *panel, bool mirror_x, boo
 static esp_err_t panel_ssd1322_disp_on_off(esp_lcd_panel_t *panel, bool on_off);
 static esp_err_t panel_ssd1322_disp_sleep(esp_lcd_panel_t *panel, bool sleep);
 
-static const size_t SCREEN_BUFFER_SIZE = 128 * 64;
+static const size_t SCREEN_BUFFER_SIZE = SSD1322_PANEL_WIDTH * SSD1322_PANEL_HEIGHT;
 
 #define SSD1322_REMAP_FLAG_COLUMN_ORDER (1U << 1)
 #define SSD1322_REMAP_FLAG_NIBBLE_ORDER (1U << 2)
@@ -78,6 +79,7 @@ esp_err_t esp_lcd_new_panel_ssd1322(
     ESP_GOTO_ON_FALSE(ssd1322, ESP_ERR_NO_MEM, err, TAG, "no mem for ssd1322 panel");
 
     // TODO: Make this an option, and an option to allocate in PSRAM
+    // TODO: spi_bus_dma_memory_alloc ?
     ssd1322->screen_buffer = heap_caps_calloc(1, SCREEN_BUFFER_SIZE, MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
     ESP_GOTO_ON_FALSE(ssd1322->screen_buffer, ESP_ERR_NO_MEM, err, TAG, "no mem for ssd1322 screen buffer");
 
@@ -201,9 +203,9 @@ static esp_err_t panel_ssd1322_init(esp_lcd_panel_t *panel) {
             io, SSD1322_SET_DISPLAY_CLOCK_DIVIDER,
             (uint8_t[]){
                 // Default 0x50 (freq 5, div 1), screen datasheet suggests 0x91 (freq 9, div 2)
-                // This value (freq 1, div 2) gets us reduced power consumption with no visible flicker.
+                // 0x11 (freq 1, div 2) gets us reduced power consumption with no visible flicker.
                 // 0x12 (freq 1, div 4) has a subtle whole-screen flicker - could investigate options between them.
-                0x11,
+                0x50,
             },
             1
         ),
@@ -215,7 +217,7 @@ static esp_err_t panel_ssd1322_init(esp_lcd_panel_t *panel) {
             io, SSD1322_SET_MULTIPLEX_RATIO,
             (uint8_t[]){
                 // Display height
-                64 - 1,
+                SSD1322_PANEL_HEIGHT - 1,
             },
             1
         ),
@@ -225,8 +227,7 @@ static esp_err_t panel_ssd1322_init(esp_lcd_panel_t *panel) {
     ESP_RETURN_ON_ERROR(panel_ssd1322_mirror(panel, true, true), TAG, "panel_ssd1322_mirror failed");
 
     // Default is 127 out of 255, this increases it to 159
-    // We'll stick with the controller default rather than the screen datasheet recommendation.
-    // ESP_RETURN_ON_ERROR(panel_ssd1322_set_contrast(panel, 0x9F), TAG, "panel_ssd1322_set_contrast failed");
+    ESP_RETURN_ON_ERROR(panel_ssd1322_set_contrast(panel, 0x9F), TAG, "panel_ssd1322_set_contrast failed");
 
     // Commenting this out doesn't seem to make any visible difference. Maybe a slight flicker.
     // According to an SSD app note, the banding we're seeing is likely incorrect pre-charging.
@@ -372,24 +373,45 @@ static esp_err_t panel_ssd1322_draw_bitmap(
 ) {
     ssd1322_panel_t *ssd1322 = __containerof(panel, ssd1322_panel_t, base);
     esp_lcd_panel_io_handle_t io = ssd1322->io;
+    
+    ESP_LOGV(TAG, "draw_bitmap(%d, %d, %d, %d)", x_start, y_start, x_end, y_end);
 
-    // TODO: Check the coordinates fit within the screen.
+    ESP_RETURN_ON_FALSE(x_start >= 0, ESP_ERR_INVALID_ARG, TAG, "draw_bitmap: x_start out of bounds");
+    ESP_RETURN_ON_FALSE(y_start >= 0, ESP_ERR_INVALID_ARG, TAG, "draw_bitmap: y_start out of bounds");
+    ESP_RETURN_ON_FALSE(x_end <= SSD1322_PANEL_WIDTH, ESP_ERR_INVALID_ARG, TAG, "draw_bitmap: x_end out of bounds");
+    ESP_RETURN_ON_FALSE(y_end <= SSD1322_PANEL_HEIGHT, ESP_ERR_INVALID_ARG, TAG, "draw_bitmap: y_end out of bounds");
+    ESP_RETURN_ON_FALSE(x_start < x_end, ESP_ERR_INVALID_ARG, TAG, "draw_bitmap: x_start >= x_end");
+    ESP_RETURN_ON_FALSE(y_start < y_end, ESP_ERR_INVALID_ARG, TAG, "draw_bitmap: y_start >= y_end");
 
-    // TODO: Allow opting out of this conversion and flush the raw buffer.
-    //       Need to also check correct (hardware) X coordinate alignment in that mode.
+    // TODO: Implement a raw mode to opt out of this conversion and buffering.
+    // Mirror the top 4 bits of each pixel to the bottom 4 bits to match the hardware alignment.
     for (int y = y_start; y < y_end; ++y) {
         for (int x = x_start; x < x_end; ++x) {
-            uint8_t pixel = ((uint8_t *)color_data)[((y - y_start) * 128) + (x - x_start)];
-            ssd1322->screen_buffer[(y * 128) + x] = (pixel & 0xF0) | (pixel >> 4);
+            uint8_t pixel = ((uint8_t *)color_data)[((y - y_start) * (x_end - x_start)) + (x - x_start)];
+            ssd1322->screen_buffer[(y * SSD1322_PANEL_WIDTH) + x] = (pixel & 0xF0) | (pixel >> 4);
         }
     }
 
-    // TODO: Only flush the dirty region rather than the full buffer.
-    // TODO: That's actually quite complex without esp_lcd_panel_io_tx_color supporting a stride.
-    //       As a middle ground, we could at least only flush full rows.
+    // esp_lcd_panel_io_tx_color doesn't support a stride, so the best we can do is full rows at a time.
+    // TODO: Remember the last set column and row addresses, so we don't have to send them every time.
+    ESP_RETURN_ON_ERROR(
+        esp_lcd_panel_io_tx_param(
+            io, SSD1322_SET_ROW_ADDRESS,
+            (uint8_t[]){
+                // The top and bottom screen extents.
+                y_start,
+                y_end - 1,
+            },
+            2
+        ),
+        TAG, "io tx param SSD1322_SET_ROW_ADDRESS failed"
+    );
+
+    size_t offset = y_start * SSD1322_PANEL_WIDTH;
+    size_t count = (y_end - y_start) * SSD1322_PANEL_WIDTH;
 
     ESP_RETURN_ON_ERROR(
-        esp_lcd_panel_io_tx_color(io, SSD1322_WRITE_RAM, ssd1322->screen_buffer, SCREEN_BUFFER_SIZE), TAG,
+        esp_lcd_panel_io_tx_color(io, SSD1322_WRITE_RAM, &ssd1322->screen_buffer[offset], count), TAG,
         "io tx color failed"
     );
 

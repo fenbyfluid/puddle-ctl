@@ -9,6 +9,9 @@
 #include "esp_err.h"
 #include "esp_lcd_panel_dev.h"
 
+#define SSD1322_PANEL_WIDTH 128
+#define SSD1322_PANEL_HEIGHT 64
+
 // SSD1322 commands
 #define SSD1322_ENABLE_GRAYSCALE_TABLE         0x00 // No params
 #define SSD1322_SET_COLUMN_ADDRESS             0x15 // 2 params, default 0, 119
