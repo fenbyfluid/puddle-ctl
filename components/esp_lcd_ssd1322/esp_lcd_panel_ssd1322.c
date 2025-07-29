@@ -285,7 +285,7 @@ static esp_err_t panel_ssd1322_init(esp_lcd_panel_t *panel) {
             0x1C, 0x5B, 0x40, 0x7F, // Below the screen, screen width (8192 bytes)
         };
 
-        for (size_t i = 0; i < sizeof(regions) / 4; i += 4) {
+        for (size_t i = 0; i < sizeof(regions); i += 4) {
             uint8_t left = regions[i];
             uint8_t right = regions[i + 1];
             uint8_t top = regions[i + 2];

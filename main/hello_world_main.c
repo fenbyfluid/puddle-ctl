@@ -240,11 +240,20 @@ void i2c_task_main(void *pvParameters) {
     i2c_master_bus_reset(bus_handle);
 
     // Probe to determine if we have a dev board (single encoder) or a prod unit (quad encoders).
-    int first_encoder = 0x43;
-    int encoder_count = 1;
-    if (i2c_master_probe(bus_handle, first_encoder, 100) == ESP_ERR_NOT_FOUND) {
+    int first_encoder = 0x00;
+    int encoder_count = 0;
+    if (i2c_master_probe(bus_handle, 0x44, 100) == ESP_OK) {
         first_encoder = 0x44;
         encoder_count = MAX_ENCODER_COUNT;
+    } else if (i2c_master_probe(bus_handle, 0x43, 100) == ESP_OK) {
+        first_encoder = 0x43;
+        encoder_count = 1;
+    } else {
+        ESP_LOGW(TAG, "No encoders detected.");
+
+        i2c_del_master_bus(bus_handle);
+        vTaskDelete(NULL);
+        return;
     }
 
     ESP_LOGI(TAG, "Detected first encoder at 0x%02X, count: %d", first_encoder, encoder_count);
