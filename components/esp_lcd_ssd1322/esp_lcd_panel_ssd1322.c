@@ -205,7 +205,7 @@ static esp_err_t panel_ssd1322_init(esp_lcd_panel_t *panel) {
                 // Default 0x50 (freq 5, div 1), screen datasheet suggests 0x91 (freq 9, div 2)
                 // 0x11 (freq 1, div 2) gets us reduced power consumption with no visible flicker.
                 // 0x12 (freq 1, div 4) has a subtle whole-screen flicker - could investigate options between them.
-                0x50,
+                0x70,
             },
             1
         ),
