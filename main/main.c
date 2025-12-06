@@ -64,11 +64,48 @@ const gpio_num_t SPI_MOSI_GPIO = 35;
 const gpio_num_t OLED_DC_GPIO = 8;
 const gpio_num_t OLED_LEFT_CS_GPIO = 18;
 const gpio_num_t OLED_RIGHT_CS_GPIO = 17;
-const gpio_num_t OLED_RESET_GPIO = 14;
+const gpio_num_t OLED_RESET_GPIO = 14; 
+
+const int32_t LEFT_SCREEN_LEFT_ENCODER_OFFSET = 17;
+const int32_t LEFT_SCREEN_RIGHT_ENCODER_OFFSET = 107;
+// const int32_t RIGHT_SCREEN_LEFT_ENCODER_OFFSET = 21;
+// const int32_t RIGHT_SCREEN_RIGHT_ENCODER_OFFSET = 110;
+
+SemaphoreHandle_t lvgl_mutex;
 
 lv_display_t *display_handles[DISPLAY_COUNT] = {NULL};
+lv_indev_t *encoder_indevs[ENCODER_COUNT] = {NULL};
 i2c_encoder_handle_t encoder_handles[ENCODER_COUNT] = {NULL};
 is31fl3746a_handle_t ring_handles[ENCODER_COUNT] = {NULL};
+
+static void lvgl_read_encoder(lv_indev_t *indev, lv_indev_data_t *data) {
+    i2c_encoder_handle_t encoder = lv_indev_get_user_data(indev);
+
+    int8_t value = 0;
+    ESP_ERROR_CHECK(i2c_encoder_read_value(encoder, &value));
+
+    data->enc_diff = value;
+
+    uint32_t flags = 0;
+    ESP_ERROR_CHECK(i2c_encoder_poll_status(encoder, &flags));
+
+    data->state = lv_indev_get_state(indev);
+
+    if ((flags & STATUS_FLAG_BUTTON_UP) == STATUS_FLAG_BUTTON_UP) {
+        data->state = LV_INDEV_STATE_RELEASED;
+    } else if ((flags & STATUS_FLAG_BUTTON_DOWN) == STATUS_FLAG_BUTTON_DOWN) {
+        data->state = LV_INDEV_STATE_PRESSED;
+    }
+
+    // Fire off our own rotary event
+    // This isn't quite valid, as the indev-sent ROTARY event param is supposed to be the target object,
+    // and then the object-sent ROTARY event param is the rotation value, but we want to catch this globally.
+    // We could use a custom event code instead, which is probably more correct, and would avoid confusion.
+    if (value != 0) {
+        int32_t rotation = value;
+        lv_indev_send_event(indev, LV_EVENT_ROTARY, &rotation);
+    }
+}
 
 void init_i2c_bus(void) {
     i2c_master_bus_config_t i2c_mst_config = {
@@ -140,11 +177,6 @@ void display_task_main(void *pvParameters) {
     };
     ESP_ERROR_CHECK(spi_bus_initialize(OLED_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
-    lv_init();
-    lv_tick_set_cb(lvgl_tick_callback);
-
-    ESP_LOGI(TAG, "LVGL initialized");
-
     for (int i = 0; i < DISPLAY_COUNT; ++i) {
         esp_lcd_panel_io_spi_config_t io_config = {
             .dc_gpio_num = OLED_DC_GPIO,
@@ -205,29 +237,33 @@ void display_task_main(void *pvParameters) {
     ESP_LOGI(TAG, "Display initialization complete, entering LVGL timer loop");
 
     for (;;) {
+        xSemaphoreTake(lvgl_mutex, portMAX_DELAY);
+
         uint32_t time_till_next = lv_timer_handler();
+
+        xSemaphoreGive(lvgl_mutex);
+
         vTaskDelay(pdMS_TO_TICKS(time_till_next));
     }
 }
 
-static void lvgl_read_encoder(lv_indev_t *indev, lv_indev_data_t *data) {
-    i2c_encoder_handle_t encoder = lv_indev_get_user_data(indev);
+void handle_rotary_event(lv_event_t *event) {
+    lv_event_code_t code = lv_event_get_code(event);
 
-    int8_t value = 0;
-    ESP_ERROR_CHECK(i2c_encoder_read_value(encoder, &value));
-
-    data->enc_diff = value;
-
-    uint32_t flags = 0;
-    ESP_ERROR_CHECK(i2c_encoder_poll_status(encoder, &flags));
-
-    data->state = lv_indev_get_state(indev);
-
-    if ((flags & STATUS_FLAG_BUTTON_UP) == STATUS_FLAG_BUTTON_UP) {
-        data->state = LV_INDEV_STATE_RELEASED;
-    } else if ((flags & STATUS_FLAG_BUTTON_DOWN) == STATUS_FLAG_BUTTON_DOWN) {
-        data->state = LV_INDEV_STATE_PRESSED;
+    if (code != LV_EVENT_ROTARY) {
+        ESP_LOGW(TAG, "Ignoring unexpected event code %s (%d)", lv_event_code_get_name(code), code);
+        return;
     }
+
+    int32_t rotation = lv_event_get_rotary_diff(event);
+
+    lv_obj_t *line = lv_event_get_user_data(event);
+
+    int32_t x = lv_obj_get_x(line);
+
+    x += rotation * abs(rotation);
+
+    lv_obj_set_x(line, x);
 }
 
 void app_main(void) {
@@ -255,6 +291,12 @@ void app_main(void) {
 
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
 
+    lv_init();
+    lv_tick_set_cb(lvgl_tick_callback);
+    ESP_LOGI(TAG, "LVGL initialized");
+
+    lvgl_mutex = xSemaphoreCreateMutex();
+
     // Start initialization of the OLED displays and LVGL in a separate task
     xTaskCreatePinnedToCore(display_task_main, "OLED", 8192, xTaskGetCurrentTaskHandle(), 1, NULL, xPortGetCoreID());
 
@@ -264,35 +306,92 @@ void app_main(void) {
     // Wait for display initialization to complete
     xTaskNotifyWait(0, 0, NULL, portMAX_DELAY);
 
-    lv_obj_t *screen = lv_display_get_screen_active(display_handles[0]);
+    // Create an input device for each encoder
+    for (int i = 0; i < ENCODER_COUNT; ++i) {
+        encoder_indevs[i] = lv_indev_create();
+        lv_indev_set_type(encoder_indevs[i], LV_INDEV_TYPE_ENCODER);
+        lv_indev_set_user_data(encoder_indevs[i], encoder_handles[i]);
+        lv_indev_set_read_cb(encoder_indevs[i], lvgl_read_encoder);
+    }
 
-    lv_obj_t *roller = lv_roller_create(screen);
-    lv_roller_set_options(roller,
-        "Stroke Start\n"
-        "Stroke Length\n"
-        "Forward Velocity\n"
-        "Forward Acceleration\n"
-        "Forward Deceleration\n"
-        "Backward Velocity\n"
-        "Backward Acceleration\n"
-        "Backward Deceleration", 
-        LV_ROLLER_MODE_NORMAL);
-    lv_obj_set_size(roller, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_border_width(roller, 0, 0);
-    lv_obj_set_style_text_line_space(roller, 2, 0);
-    lv_obj_set_style_anim_duration(roller, 0, 0);
+    ESP_LOGI(TAG, "Hardware initialization complete");
 
-    lv_indev_t *indev = lv_indev_create();
-    lv_indev_set_type(indev, LV_INDEV_TYPE_ENCODER);
-    lv_indev_set_user_data(indev, encoder_handles[0]);
-    lv_indev_set_read_cb(indev, lvgl_read_encoder);
+    // TODO: Skip USB-OTG initialization if button held at boot
+    {
+        lv_indev_read(encoder_indevs[0]);
+        lv_indev_state_t state = lv_indev_get_state(encoder_indevs[0]);
 
-    lv_group_t *group = lv_group_create();
-    lv_group_add_obj(group, roller);
-    lv_indev_set_group(indev, group);
+        ESP_LOGI(TAG, "Encoder 0 startup state: %d", state);
+    }
 
-    // TODO: Wait for an event from other tasks indicating initialization is complete
-    ESP_LOGI(TAG, "Initialization complete");
+    // TODO: Create an initial test UI
+    if (true) {
+        xSemaphoreTake(lvgl_mutex, portMAX_DELAY);
+
+        lv_obj_t *screen_left = lv_display_get_screen_active(display_handles[0]);
+        lv_obj_t *label_left = lv_label_create(screen_left);
+        lv_label_set_text(label_left, "Puddle");
+        lv_obj_center(label_left);
+
+        lv_obj_t *screen_right = lv_display_get_screen_active(display_handles[1]);
+        lv_obj_t *label_right = lv_label_create(screen_right);
+        lv_label_set_text(label_right, "Maker");
+        lv_obj_center(label_right);
+
+        xSemaphoreGive(lvgl_mutex);
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        xSemaphoreTake(lvgl_mutex, portMAX_DELAY);
+
+        lv_display_set_default(display_handles[0]);
+        lv_obj_t *left_screen = lv_obj_create(NULL);
+
+        lv_obj_t *left_label = lv_label_create(left_screen);
+        lv_label_set_text(left_label, "Start");
+        lv_obj_align(left_label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+        {
+            lv_obj_update_layout(left_label);
+            int32_t center = lv_obj_get_x(left_label) + (lv_obj_get_width(left_label) / 2);
+            int32_t target_center = LEFT_SCREEN_LEFT_ENCODER_OFFSET;
+            if (center < target_center) {
+                lv_obj_set_x(left_label, target_center - center);
+            }
+        }
+
+        lv_obj_t *right_label = lv_label_create(left_screen);
+        lv_label_set_text(right_label, "End");
+        lv_obj_align(right_label, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+
+        {
+            lv_obj_update_layout(right_label);
+            int32_t center = lv_obj_get_x(right_label) + (lv_obj_get_width(right_label) / 2);
+            int32_t target_center = LEFT_SCREEN_RIGHT_ENCODER_OFFSET;
+            if (center > target_center) {
+                lv_obj_set_x(right_label, target_center - center);
+            }
+        }
+
+        lv_screen_load_anim(left_screen, LV_SCREEN_LOAD_ANIM_MOVE_TOP, 500, 0, true);
+
+        lv_display_set_default(display_handles[1]);
+        lv_obj_t *right_screen = lv_obj_create(NULL);
+
+        lv_obj_t *line = lv_obj_create(right_screen);
+        lv_obj_remove_style_all(line);
+        lv_obj_set_size(line, 1, 8);
+        lv_obj_align(line, LV_ALIGN_BOTTOM_LEFT, 20, 0);
+        lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(line, lv_color_white(), 0);
+        
+        i2c_encoder_set_led_color(encoder_handles[0], 255, 0, 0);
+        lv_indev_add_event_cb(encoder_indevs[0], handle_rotary_event, LV_EVENT_ROTARY, line);
+
+        lv_screen_load_anim(right_screen, LV_SCREEN_LOAD_ANIM_MOVE_TOP, 500, 0, true);
+
+        xSemaphoreGive(lvgl_mutex);
+    }
 
     // xTaskCreatePinnedToCore(i2c_task_main, "I2C", 8192, NULL, 1, NULL, xPortGetCoreID());
     // xTaskCreatePinnedToCore(usb_task_main, "USB", 8192, NULL, 1, NULL, xPortGetCoreID());
