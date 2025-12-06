@@ -73,15 +73,15 @@ typedef enum {
 } i2c_encoder_gconf2_flag_t;
 
 typedef enum {
-    STATUS_FLAG_IPUSHR = (1 << 0), 
-    STATUS_FLAG_IPUSHP = (1 << 1),
-    STATUS_FLAG_IPUSHD = (1 << 2),
-    STATUS_FLAG_IRINC = (1 << 3),
-    STATUS_FLAG_IRDEC = (1 << 4),
-    STATUS_FLAG_IRMAX = (1 << 5),
-    STATUS_FLAG_IRMIN = (1 << 6),
-    STATUS_FLAG_INT2 = (1 << 7),
-} i2c_encoder_status_flag_t;
+    ISTATUS_FLAG_IPUSHR = (1 << 0), 
+    ISTATUS_FLAG_IPUSHP = (1 << 1),
+    ISTATUS_FLAG_IPUSHD = (1 << 2),
+    ISTATUS_FLAG_IRINC = (1 << 3),
+    ISTATUS_FLAG_IRDEC = (1 << 4),
+    ISTATUS_FLAG_IRMAX = (1 << 5),
+    ISTATUS_FLAG_IRMIN = (1 << 6),
+    ISTATUS_FLAG_INT2 = (1 << 7),
+} i2c_encoder_interrupt_status_flag_t;
 
 typedef enum {
     STATUS2_FLAG_GP1_POS = (1 << 0), 
@@ -206,7 +206,7 @@ esp_err_t i2c_encoder_reg_write_s32(i2c_encoder_handle_t handle, uint8_t reg, in
     return ESP_OK;
 }
 
-esp_err_t i2c_encoder_init(i2c_encoder_handle_t handle, bool relative_mode) {
+esp_err_t i2c_encoder_init(i2c_encoder_handle_t handle, bool relative_mode, i2c_encoder_status_flag_t interrupts) {
     if (!handle) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -226,6 +226,7 @@ esp_err_t i2c_encoder_init(i2c_encoder_handle_t handle, bool relative_mode) {
     ESP_RETURN_ON_ERROR(i2c_encoder_reg_write(handle, REG_GCONF, flags & ~GCONF_FLAG_RESET), TAG, "Failed to configure GCONF");
     ESP_RETURN_ON_ERROR(i2c_encoder_reg_write(handle, REG_GCONF2, GCONF2_FLAG_CKSRC | (relative_mode ? GCONF2_FLAG_RELMOD : 0)), TAG, "Failed to configure GCONF2");
     ESP_RETURN_ON_ERROR(i2c_encoder_reg_write(handle, REG_ANTBOUNC, 5), TAG, "Failed to configure ANTBOUNC"); // Intervals of 0.192ms, so ~1ms
+    ESP_RETURN_ON_ERROR(i2c_encoder_reg_write(handle, REG_INTCONF, interrupts), TAG, "Failed to configure INTCONF");
 
     return ESP_OK;
 }
@@ -255,103 +256,77 @@ esp_err_t i2c_encoder_set_led_color(i2c_encoder_handle_t handle, uint8_t r, uint
     return ESP_OK;
 }
 
-esp_err_t i2c_encoder_poll_status(i2c_encoder_handle_t handle) { 
+esp_err_t i2c_encoder_poll_status(i2c_encoder_handle_t handle, uint32_t *flags) { 
     if (!handle) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    i2c_encoder_dev_t *device = (i2c_encoder_dev_t *)handle;
+    uint8_t value;
+    ESP_RETURN_ON_ERROR(i2c_encoder_reg_read(handle, REG_ESTATUS, &value), TAG, "Failed to read encoder status");
 
-    uint8_t status;
-    ESP_RETURN_ON_ERROR(i2c_encoder_reg_read(handle, REG_ESTATUS, &status), TAG, "Failed to read encoder status");
+    *flags = value;
 
-    ESP_LOGD(TAG, "Encoder status: 0x%02X", status);
+    if ((value & ISTATUS_FLAG_INT2) == ISTATUS_FLAG_INT2) {
+        ESP_RETURN_ON_ERROR(i2c_encoder_reg_read(handle, REG_I2STATUS, &value), TAG, "Failed to read secondary status");
 
-    if ((status & STATUS_FLAG_INT2) == 0) {
-        return ESP_OK;
+        *flags |= (value << 8);
+
+        if ((value & STATUS2_FLAG_FADE) == STATUS2_FLAG_FADE) {
+            ESP_RETURN_ON_ERROR(i2c_encoder_reg_read(handle, REG_FSTATUS, &value), TAG, "Failed to read fade status");
+
+            *flags |= (value << 16);
+        }
     }
-
-    uint8_t secondary_status;
-    ESP_RETURN_ON_ERROR(i2c_encoder_reg_read(handle, REG_I2STATUS, &secondary_status), TAG, "Failed to read secondary status");
-
-    ESP_LOGD(TAG, "Encoder secondary status: 0x%02X", secondary_status);
-
-    if ((secondary_status & STATUS2_FLAG_FADE) == 0) {
-        return ESP_OK;
-    }
-
-    uint8_t fade_status;
-    ESP_RETURN_ON_ERROR(i2c_encoder_reg_read(handle, REG_FSTATUS, &fade_status), TAG, "Failed to read fade status");
-
-    ESP_LOGD(TAG, "Encoder fade status: 0x%02X", fade_status);
 
     return ESP_OK;
 }
 
 static EventGroupHandle_t encoder_event_group = NULL;
-#define ENCODER_INTERRUPT_BIT (1 << 0)
+static EventBits_t encoder_interrupt_bit = 0;
 
 static void IRAM_ATTR on_encoder_interrupt(void *arg) {
     (void)arg;
 
-    ESP_DRAM_LOGI(TAG, "i2c encoder interrupt!");
+    ESP_DRAM_LOGD(TAG, "i2c encoder interrupt!");
 
-    if (!encoder_event_group) {
+    if (!encoder_event_group || !encoder_interrupt_bit) {
         return;
     }
 
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xEventGroupSetBitsFromISR(encoder_event_group, ENCODER_INTERRUPT_BIT, &xHigherPriorityTaskWoken);
+    xEventGroupSetBitsFromISR(encoder_event_group, encoder_interrupt_bit, &xHigherPriorityTaskWoken);
     if (xHigherPriorityTaskWoken) {
         portYIELD_FROM_ISR();
     }
 }
 
-esp_err_t i2c_encoder_setup_interrupt(gpio_num_t intr_gpio, bool enable) {
+esp_err_t i2c_encoder_setup_interrupt(gpio_num_t intr_gpio, EventGroupHandle_t event_group, EventBits_t interrupt_bit) {
     gpio_reset_pin(intr_gpio);
 
-    if (!encoder_event_group) {
-        encoder_event_group = xEventGroupCreate();
-        if (!encoder_event_group) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (enable) {
-        gpio_config_t intr_conf = {
-            .pin_bit_mask = (1ULL << intr_gpio),
-            .mode = GPIO_MODE_INPUT,
-            .pull_up_en = GPIO_PULLUP_ENABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_NEGEDGE,
-        };
-
-        gpio_config(&intr_conf);
-
-        gpio_isr_handler_add(intr_gpio, on_encoder_interrupt, NULL);
-
-        gpio_intr_enable(intr_gpio);
-    } else {
+    if (!event_group || !interrupt_bit) {
         gpio_intr_disable(intr_gpio);
 
         gpio_isr_handler_remove(intr_gpio);
+
+        return ESP_OK;
     }
+
+    encoder_event_group = event_group;
+    encoder_interrupt_bit = interrupt_bit;
+
+    gpio_config_t intr_conf = {
+        .pin_bit_mask = (1ULL << intr_gpio),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+
+    gpio_config(&intr_conf);
+
+    gpio_isr_handler_add(intr_gpio, on_encoder_interrupt, NULL);
+
+    gpio_intr_enable(intr_gpio);
 
     return ESP_OK;
-}
-
-esp_err_t i2c_encoder_wait_for_interrupt(TickType_t ticks_to_wait) { 
-    if (!encoder_event_group) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    EventBits_t bits = xEventGroupWaitBits(
-        encoder_event_group,
-        ENCODER_INTERRUPT_BIT,
-        pdTRUE,
-        pdFALSE,
-        ticks_to_wait
-    );
-
-    return (bits & ENCODER_INTERRUPT_BIT) ? ESP_OK : ESP_ERR_TIMEOUT;
 }

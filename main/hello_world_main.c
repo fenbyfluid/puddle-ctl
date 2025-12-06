@@ -264,11 +264,11 @@ void i2c_task_main(void *pvParameters) {
     i2c_encoder_handle_t encoder_handles[MAX_ENCODER_COUNT] = {NULL};
     for (int i = 0; i < encoder_count; ++i) {
         ESP_ERROR_CHECK(i2c_encoder_create(bus_handle, first_encoder + i, I2C_CLOCK_SPEED, &encoder_handles[i]));
-        ESP_ERROR_CHECK(i2c_encoder_init(encoder_handles[i], false));
+        ESP_ERROR_CHECK(i2c_encoder_init(encoder_handles[i], false, 0));
         ESP_ERROR_CHECK(i2c_encoder_set_range(encoder_handles[i], 0, IS31FL3746A_LED_COUNT, 1));
     }
 
-    ESP_ERROR_CHECK(i2c_encoder_setup_interrupt(ENCODER_INTR_GPIO, true));
+    // ESP_ERROR_CHECK(i2c_encoder_setup_interrupt(ENCODER_INTR_GPIO, ...));
 
     is31fl3746a_handle_t ring_handles[MAX_ENCODER_COUNT] = {NULL};
     for (int i = 0; i < encoder_count; ++i) {
@@ -292,7 +292,7 @@ void i2c_task_main(void *pvParameters) {
     // TODO: Implement an exit condition for this task.
     for (;;) {
         for (int i = 0; i < encoder_count; ++i) {
-            // ESP_ERROR_CHECK(i2c_encoder_poll_status(encoder_handles[i]));
+            // ESP_ERROR_CHECK(i2c_encoder_poll_status(encoder_handles[i], ...));
 
             int8_t value;
             ESP_ERROR_CHECK(i2c_encoder_read_value(encoder_handles[i], &value));
