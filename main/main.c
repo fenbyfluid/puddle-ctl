@@ -33,6 +33,7 @@
 #include "esp_lcd_io_spi.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_private/usb_phy.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -41,6 +42,8 @@
 #include "esp_lcd_panel_ssd1322.h"
 #include "duppa_i2c_encoder.h"
 #include "duppa_rgb_led_ring_small.h"
+
+#include "usb.h"
 
 LV_FONT_DECLARE(monogram)
 lv_font_t const *default_font = &monogram;
@@ -236,7 +239,26 @@ void display_task_main(void *pvParameters) {
 
     ESP_LOGI(TAG, "Display initialization complete, entering LVGL timer loop");
 
+    bool contrast_dimmed = false;
+
     for (;;) {
+        uint32_t inactive_time = lv_display_get_inactive_time(NULL);
+        if (inactive_time > 10000) {
+            if (!contrast_dimmed) {
+                ESP_LOGI(TAG, "Dimming display contrast due to inactivity");
+                panel_ssd1322_set_contrast(lv_display_get_user_data(display_handles[0]), 0x10);
+                panel_ssd1322_set_contrast(lv_display_get_user_data(display_handles[1]), 0x10);
+                contrast_dimmed = true;
+            }
+        } else {
+            if (contrast_dimmed) {
+                ESP_LOGI(TAG, "Restoring display contrast due to activity");
+                panel_ssd1322_set_contrast(lv_display_get_user_data(display_handles[0]), 0x9F);
+                panel_ssd1322_set_contrast(lv_display_get_user_data(display_handles[1]), 0x9F);
+                contrast_dimmed = false;
+            }
+        }
+
         xSemaphoreTake(lvgl_mutex, portMAX_DELAY);
 
         uint32_t time_till_next = lv_timer_handler();
@@ -264,6 +286,18 @@ void handle_rotary_event(lv_event_t *event) {
     x += rotation * abs(rotation);
 
     lv_obj_set_x(line, x);
+}
+
+void handle_restart_button(lv_event_t *event) {
+    lv_event_code_t code = lv_event_get_code(event);
+
+    if (code != LV_EVENT_CLICKED) {
+        ESP_LOGW(TAG, "Ignoring unexpected event code %s (%d)", lv_event_code_get_name(code), code);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Restart button clicked, restarting system");
+    esp_restart();
 }
 
 void app_main(void) {
@@ -316,12 +350,22 @@ void app_main(void) {
 
     ESP_LOGI(TAG, "Hardware initialization complete");
 
-    // TODO: Skip USB-OTG initialization if button held at boot
     {
         lv_indev_read(encoder_indevs[0]);
         lv_indev_state_t state = lv_indev_get_state(encoder_indevs[0]);
 
-        ESP_LOGI(TAG, "Encoder 0 startup state: %d", state);
+        if (state == LV_INDEV_STATE_RELEASED) {
+            xTaskCreatePinnedToCore(usb_task_main, "USB", 8192, NULL, 1, NULL, xPortGetCoreID());
+        } else if (state == LV_INDEV_STATE_PRESSED) {
+            ESP_LOGI(TAG, "Skipping USB initialization due to button held at boot");
+
+            // Switch the USB PHY back to Serial/Jtag mode, disabling OTG support.
+            usb_phy_handle_t phy_hdl;
+            usb_phy_config_t phy_conf = {
+                .controller = USB_PHY_CTRL_SERIAL_JTAG,
+            };
+            ESP_ERROR_CHECK(usb_new_phy(&phy_conf, &phy_hdl));
+        }
     }
 
     // TODO: Create an initial test UI
@@ -388,13 +432,45 @@ void app_main(void) {
         i2c_encoder_set_led_color(encoder_handles[0], 255, 0, 0);
         lv_indev_add_event_cb(encoder_indevs[0], handle_rotary_event, LV_EVENT_ROTARY, line);
 
+        lv_obj_t *button = lv_btn_create(right_screen);
+        lv_obj_add_event_cb(button, handle_restart_button, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *button_label = lv_label_create(button);
+        lv_label_set_text(button_label, "Restart");
+        lv_obj_center(button);
+        lv_obj_align(button, LV_ALIGN_CENTER, 0, 0);
+
+        lv_group_t *group = lv_group_create();
+        lv_group_add_obj(group, button);
+        lv_indev_set_display(encoder_indevs[3], display_handles[1]);
+        lv_indev_set_group(encoder_indevs[3], group);
+        lv_group_focus_obj(button);
+        i2c_encoder_set_led_color(encoder_handles[3], 0, 0, 255);
+
         lv_screen_load_anim(right_screen, LV_SCREEN_LOAD_ANIM_MOVE_TOP, 500, 0, true);
 
         xSemaphoreGive(lvgl_mutex);
     }
 
-    // xTaskCreatePinnedToCore(i2c_task_main, "I2C", 8192, NULL, 1, NULL, xPortGetCoreID());
-    // xTaskCreatePinnedToCore(usb_task_main, "USB", 8192, NULL, 1, NULL, xPortGetCoreID());
+    // TODO: Test HID report sending. Need to abstract this away into our own concept of StrokeParams
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        if (!tud_hid_ready()) {
+            continue;
+        }
+
+        uint8_t report[CFG_TUD_HID_EP_BUFSIZE - 1] = {0x00};
+        report[0] = 0x00; // Report ID
+        report[1] = 0x11; // Param 1
+        report[2] = 0x22; // Param 2
+        report[3] = 0x33; // Param 3
+        report[4] = 0x44; // Param 4
+
+        // TODO: HID reports are only arriving at our host program when they're the full size of the endpoint buffer.
+        tud_hid_report(1, report, sizeof(report));
+
+        // ESP_LOGD(TAG, "Sent HID report");
+    }
 
     // Print heap memory usage statistics every 10 seconds
     for (;;) {
