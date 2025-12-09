@@ -225,7 +225,7 @@ esp_err_t i2c_encoder_init(i2c_encoder_handle_t handle, bool relative_mode, i2c_
 
     ESP_RETURN_ON_ERROR(i2c_encoder_reg_write(handle, REG_GCONF, flags & ~GCONF_FLAG_RESET), TAG, "Failed to configure GCONF");
     ESP_RETURN_ON_ERROR(i2c_encoder_reg_write(handle, REG_GCONF2, GCONF2_FLAG_CKSRC | (relative_mode ? GCONF2_FLAG_RELMOD : 0)), TAG, "Failed to configure GCONF2");
-    ESP_RETURN_ON_ERROR(i2c_encoder_reg_write(handle, REG_ANTBOUNC, 5), TAG, "Failed to configure ANTBOUNC"); // Intervals of 0.192ms, so ~1ms
+    ESP_RETURN_ON_ERROR(i2c_encoder_reg_write(handle, REG_ANTBOUNC, 3), TAG, "Failed to configure ANTBOUNC"); // Intervals of 0.192ms, so ~0.5ms
     ESP_RETURN_ON_ERROR(i2c_encoder_reg_write(handle, REG_INTCONF, interrupts), TAG, "Failed to configure INTCONF");
 
     return ESP_OK;

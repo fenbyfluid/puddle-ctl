@@ -3,23 +3,23 @@
  * - USB HID interface, send current values to host, receive current status
  * - Show current state on displays
  * - Provide reasonable feedback via LED rings
- * 
+ *
  * Should have:
  * - On-screen configuration UI and persistent storage
  * - Option to bypass USB init by holding a button at boot
- * 
+ *
  * Nice to have:
  * - Opt-in USB CDC console output for debugging
  * - USB boot-to-DFU support, with a minimal DFU firmware doing OTA update
  * - BT HID interface for wireless support
- * 
+ *
  * Maybe have:
  * - Wi-Fi client interface for wireless support
- * 
+ *
  * TODO notes:
  * - Consider burning USB_PHY_SEL eFuse to stop JTAG/Serial trying to enumerate during bootloader
  *   This'll limit our debugging options, but we'll still be able to use the boot button to enter bootloader DFU mode
- * 
+ *
  */
 
 #include <inttypes.h>
@@ -27,33 +27,32 @@
 #define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
 
 #include "driver/gpio.h"
-#include "esp_log.h"
-#include "esp_system.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_io_spi.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_log.h"
 #include "esp_private/usb_phy.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "lvgl.h"
 
-#include "esp_lcd_panel_ssd1322.h"
 #include "duppa_i2c_encoder.h"
 #include "duppa_rgb_led_ring_small.h"
+#include "esp_lcd_panel_ssd1322.h"
 
+#include "globals.h"
+#include "state.h"
 #include "usb.h"
 
 LV_FONT_DECLARE(monogram)
 lv_font_t const *default_font = &monogram;
 
 #define I2C_CLOCK_SPEED 100000 // 100 kHz - need stronger pull-ups for 400 kHz
-#define OLED_SPI_CLOCK_SPEED (8 * 1000 * 1000) // We should be able to go up to 10 MHz - according to Logic, 10 oscillates between 8 and 12
+#define OLED_SPI_CLOCK_SPEED (8 * 1000 * 1000) // We should be able to go up to 10 MHz, but it's a little unstable
 #define OLED_SPI_HOST SPI2_HOST
-
-#define DISPLAY_COUNT 2
-#define ENCODER_COUNT 4
 
 static const char *TAG = "main";
 
@@ -67,12 +66,7 @@ const gpio_num_t SPI_MOSI_GPIO = 35;
 const gpio_num_t OLED_DC_GPIO = 8;
 const gpio_num_t OLED_LEFT_CS_GPIO = 18;
 const gpio_num_t OLED_RIGHT_CS_GPIO = 17;
-const gpio_num_t OLED_RESET_GPIO = 14; 
-
-const int32_t LEFT_SCREEN_LEFT_ENCODER_OFFSET = 17;
-const int32_t LEFT_SCREEN_RIGHT_ENCODER_OFFSET = 107;
-// const int32_t RIGHT_SCREEN_LEFT_ENCODER_OFFSET = 21;
-// const int32_t RIGHT_SCREEN_RIGHT_ENCODER_OFFSET = 110;
+const gpio_num_t OLED_RESET_GPIO = 14;
 
 SemaphoreHandle_t lvgl_mutex;
 
@@ -92,9 +86,11 @@ static void lvgl_read_encoder(lv_indev_t *indev, lv_indev_data_t *data) {
     uint32_t flags = 0;
     ESP_ERROR_CHECK(i2c_encoder_poll_status(encoder, &flags));
 
+    bool button_released = false;
     data->state = lv_indev_get_state(indev);
 
     if ((flags & STATUS_FLAG_BUTTON_UP) == STATUS_FLAG_BUTTON_UP) {
+        button_released = true;
         data->state = LV_INDEV_STATE_RELEASED;
     } else if ((flags & STATUS_FLAG_BUTTON_DOWN) == STATUS_FLAG_BUTTON_DOWN) {
         data->state = LV_INDEV_STATE_PRESSED;
@@ -107,6 +103,12 @@ static void lvgl_read_encoder(lv_indev_t *indev, lv_indev_data_t *data) {
     if (value != 0) {
         int32_t rotation = value;
         lv_indev_send_event(indev, LV_EVENT_ROTARY, &rotation);
+    }
+
+    // This is an even worse hack, but luckily for us LVGL doesn't currently raise any indev events for encoders.
+    // Without us firing this, we need to use groups for even basic handling, which adds a lot of navigation mode complexity.
+    if (button_released) {
+        lv_indev_send_event(indev, LV_EVENT_CLICKED, NULL);
     }
 }
 
@@ -159,11 +161,7 @@ static uint32_t lvgl_tick_callback(void) {
 static void lvgl_flush_callback(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
     esp_lcd_panel_handle_t panel_handle = lv_display_get_user_data(disp);
 
-    esp_lcd_panel_draw_bitmap(
-        panel_handle,
-        area->x1, area->y1,
-        area->x2 + 1, area->y2 + 1,
-        px_map);
+    esp_lcd_panel_draw_bitmap(panel_handle, area->x1, area->y1, area->x2 + 1, area->y2 + 1, px_map);
 
     // Our draw bitmap implementation buffers internally, so we don't need LVGL to double-buffer.
     lv_display_flush_ready(disp);
@@ -230,6 +228,7 @@ void display_task_main(void *pvParameters) {
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
     }
 
+    // TODO: This theme is still a little too complex - consider making our own
     lv_theme_t *theme = lv_theme_mono_init(display_handles[0], true, default_font);
     lv_display_set_theme(display_handles[0], theme);
     lv_display_set_theme(display_handles[1], theme);
@@ -243,7 +242,7 @@ void display_task_main(void *pvParameters) {
 
     for (;;) {
         uint32_t inactive_time = lv_display_get_inactive_time(NULL);
-        if (inactive_time > 10000) {
+        if (inactive_time > 30000) {
             if (!contrast_dimmed) {
                 ESP_LOGI(TAG, "Dimming display contrast due to inactivity");
                 panel_ssd1322_set_contrast(lv_display_get_user_data(display_handles[0]), 0x10);
@@ -269,40 +268,9 @@ void display_task_main(void *pvParameters) {
     }
 }
 
-void handle_rotary_event(lv_event_t *event) {
-    lv_event_code_t code = lv_event_get_code(event);
-
-    if (code != LV_EVENT_ROTARY) {
-        ESP_LOGW(TAG, "Ignoring unexpected event code %s (%d)", lv_event_code_get_name(code), code);
-        return;
-    }
-
-    int32_t rotation = lv_event_get_rotary_diff(event);
-
-    lv_obj_t *line = lv_event_get_user_data(event);
-
-    int32_t x = lv_obj_get_x(line);
-
-    x += rotation * abs(rotation);
-
-    lv_obj_set_x(line, x);
-}
-
-void handle_restart_button(lv_event_t *event) {
-    lv_event_code_t code = lv_event_get_code(event);
-
-    if (code != LV_EVENT_CLICKED) {
-        ESP_LOGW(TAG, "Ignoring unexpected event code %s (%d)", lv_event_code_get_name(code), code);
-        return;
-    }
-
-    ESP_LOGI(TAG, "Restart button clicked, restarting system");
-    esp_restart();
-}
-
 void app_main(void) {
     esp_log_level_set(TAG, ESP_LOG_DEBUG);
-    
+
     // SPI logging is very noisy
     esp_log_level_set("spi_master", ESP_LOG_INFO);
 
@@ -354,6 +322,9 @@ void app_main(void) {
         lv_indev_read(encoder_indevs[0]);
         lv_indev_state_t state = lv_indev_get_state(encoder_indevs[0]);
 
+        // TODO: Invert the condition to speed up development
+        // state = (state == LV_INDEV_STATE_PRESSED) ? LV_INDEV_STATE_RELEASED : LV_INDEV_STATE_PRESSED;
+
         if (state == LV_INDEV_STATE_RELEASED) {
             xTaskCreatePinnedToCore(usb_task_main, "USB", 8192, NULL, 1, NULL, xPortGetCoreID());
         } else if (state == LV_INDEV_STATE_PRESSED) {
@@ -368,108 +339,15 @@ void app_main(void) {
         }
     }
 
-    // TODO: Create an initial test UI
-    if (true) {
-        xSemaphoreTake(lvgl_mutex, portMAX_DELAY);
+    {
+        lv_indev_read(encoder_indevs[3]);
+        lv_indev_state_t state = lv_indev_get_state(encoder_indevs[3]);
 
-        lv_obj_t *screen_left = lv_display_get_screen_active(display_handles[0]);
-        lv_obj_t *label_left = lv_label_create(screen_left);
-        lv_label_set_text(label_left, "Puddle");
-        lv_obj_center(label_left);
-
-        lv_obj_t *screen_right = lv_display_get_screen_active(display_handles[1]);
-        lv_obj_t *label_right = lv_label_create(screen_right);
-        lv_label_set_text(label_right, "Maker");
-        lv_obj_center(label_right);
-
-        xSemaphoreGive(lvgl_mutex);
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
-
-        xSemaphoreTake(lvgl_mutex, portMAX_DELAY);
-
-        lv_display_set_default(display_handles[0]);
-        lv_obj_t *left_screen = lv_obj_create(NULL);
-
-        lv_obj_t *left_label = lv_label_create(left_screen);
-        lv_label_set_text(left_label, "Start");
-        lv_obj_align(left_label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-
-        {
-            lv_obj_update_layout(left_label);
-            int32_t center = lv_obj_get_x(left_label) + (lv_obj_get_width(left_label) / 2);
-            int32_t target_center = LEFT_SCREEN_LEFT_ENCODER_OFFSET;
-            if (center < target_center) {
-                lv_obj_set_x(left_label, target_center - center);
-            }
+        if (state == LV_INDEV_STATE_RELEASED) {
+            xTaskCreatePinnedToCore(state_task_main, "StateMgr", 8192, NULL, 1, NULL, xPortGetCoreID());
+        } else if (state == LV_INDEV_STATE_PRESSED) {
+            ESP_LOGI(TAG, "Skipping runtime due to button held at boot");
         }
-
-        lv_obj_t *right_label = lv_label_create(left_screen);
-        lv_label_set_text(right_label, "End");
-        lv_obj_align(right_label, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
-
-        {
-            lv_obj_update_layout(right_label);
-            int32_t center = lv_obj_get_x(right_label) + (lv_obj_get_width(right_label) / 2);
-            int32_t target_center = LEFT_SCREEN_RIGHT_ENCODER_OFFSET;
-            if (center > target_center) {
-                lv_obj_set_x(right_label, target_center - center);
-            }
-        }
-
-        lv_screen_load_anim(left_screen, LV_SCREEN_LOAD_ANIM_MOVE_TOP, 500, 0, true);
-
-        lv_display_set_default(display_handles[1]);
-        lv_obj_t *right_screen = lv_obj_create(NULL);
-
-        lv_obj_t *line = lv_obj_create(right_screen);
-        lv_obj_remove_style_all(line);
-        lv_obj_set_size(line, 1, 8);
-        lv_obj_align(line, LV_ALIGN_BOTTOM_LEFT, 20, 0);
-        lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_color(line, lv_color_white(), 0);
-        
-        i2c_encoder_set_led_color(encoder_handles[0], 255, 0, 0);
-        lv_indev_add_event_cb(encoder_indevs[0], handle_rotary_event, LV_EVENT_ROTARY, line);
-
-        lv_obj_t *button = lv_btn_create(right_screen);
-        lv_obj_add_event_cb(button, handle_restart_button, LV_EVENT_CLICKED, NULL);
-        lv_obj_t *button_label = lv_label_create(button);
-        lv_label_set_text(button_label, "Restart");
-        lv_obj_center(button);
-        lv_obj_align(button, LV_ALIGN_CENTER, 0, 0);
-
-        lv_group_t *group = lv_group_create();
-        lv_group_add_obj(group, button);
-        lv_indev_set_display(encoder_indevs[3], display_handles[1]);
-        lv_indev_set_group(encoder_indevs[3], group);
-        lv_group_focus_obj(button);
-        i2c_encoder_set_led_color(encoder_handles[3], 0, 0, 255);
-
-        lv_screen_load_anim(right_screen, LV_SCREEN_LOAD_ANIM_MOVE_TOP, 500, 0, true);
-
-        xSemaphoreGive(lvgl_mutex);
-    }
-
-    // TODO: Test HID report sending. Need to abstract this away into our own concept of StrokeParams
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-
-        if (!tud_hid_ready()) {
-            continue;
-        }
-
-        uint8_t report[CFG_TUD_HID_EP_BUFSIZE - 1] = {0x00};
-        report[0] = 0x00; // Report ID
-        report[1] = 0x11; // Param 1
-        report[2] = 0x22; // Param 2
-        report[3] = 0x33; // Param 3
-        report[4] = 0x44; // Param 4
-
-        // TODO: HID reports are only arriving at our host program when they're the full size of the endpoint buffer.
-        tud_hid_report(1, report, sizeof(report));
-
-        // ESP_LOGD(TAG, "Sent HID report");
     }
 
     // Print heap memory usage statistics every 10 seconds
@@ -482,7 +360,9 @@ void app_main(void) {
         size_t min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
         float used_percent = 100.0f * (total_heap - free_heap) / total_heap;
 
-        ESP_LOGI(TAG, "Heap stats: Total = %u, Free = %u, Min Free = %u, Used = %.2f%%",
-            total_heap, free_heap, min_free_heap, used_percent);
+        ESP_LOGI(
+            TAG, "Heap stats: Total = %u, Free = %u, Min Free = %u, Used = %.2f%%",
+            total_heap, free_heap, min_free_heap, used_percent
+        );
     }
 }
