@@ -24,7 +24,7 @@ enum {
     STRID_SERIAL,
     STRID_HID_INTERFACE,
     STRID_CDC_INTERFACE,
-    // STRID_DFU_RT_INTERFACE,
+    STRID_DFU_RT_INTERFACE,
     STRID_TOTAL,
 };
 
@@ -35,17 +35,17 @@ const char *descriptor_strings[] = {
     serial_number,                           // 3: Serials, should use chip ID
     CONFIG_TINYUSB_DESC_PRODUCT_STRING,      // 4: HID Interface
     CONFIG_TINYUSB_DESC_CDC_STRING,          // 5: CDC Interface
-    // CONFIG_TINYUSB_DESC_PRODUCT_STRING,      // 6: DFU Runtime Interface
+    CONFIG_TINYUSB_DESC_PRODUCT_STRING,      // 6: DFU Runtime Interface
     NULL, // NULL: Must be last. Indicates end of array
 };
 
-// TODO: Having trouble getting interfaces to be detected when DFU runtime is included.
-#define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + (1 * TUD_HID_INOUT_DESC_LEN) + (1 * TUD_CDC_DESC_LEN) + (0 * TUD_DFU_RT_DESC_LEN))
+#define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + (1 * TUD_HID_INOUT_DESC_LEN) + (1 * TUD_CDC_DESC_LEN) + (1 * TUD_DFU_RT_DESC_LEN))
 
 enum {
     ITF_NUM_HID = 0,
     ITF_NUM_CDC,
-    // ITF_NUM_DFU_RT,
+    ITF_NUM_CDC_DATA, // CDC occupies two interface slots (communication + data)
+    ITF_NUM_DFU_RT,
     ITF_NUM_TOTAL,
 };
 
@@ -64,7 +64,7 @@ static const uint8_t configuration_descriptor[] = {
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, STRID_CDC_INTERFACE, 0x82, 8, 0x03, 0x83, CFG_TUD_ENDPOINT0_SIZE),
 
     // Interface number, string index, attributes, detach timeout, transfer size
-    // TUD_DFU_RT_DESCRIPTOR(ITF_NUM_DFU_RT, STRID_DFU_RT_INTERFACE, DFU_ATTR_CAN_DOWNLOAD | DFU_ATTR_MANIFESTATION_TOLERANT| DFU_ATTR_WILL_DETACH, 1000, CFG_TUD_ENDPOINT0_SIZE),
+    TUD_DFU_RT_DESCRIPTOR(ITF_NUM_DFU_RT, STRID_DFU_RT_INTERFACE, DFU_ATTR_CAN_DOWNLOAD | DFU_ATTR_MANIFESTATION_TOLERANT| DFU_ATTR_WILL_DETACH, 1000, CFG_TUD_ENDPOINT0_SIZE),
 };
 
 // Mandatory HID callbacks follow
@@ -189,14 +189,23 @@ void tud_hid_report_failed_cb(uint8_t instance, hid_report_type_t report_type, u
 
 // Mandatory DFU callbacks follow
 
+#include "soc/rtc_cntl_reg.h"
+#include "esp32s3/rom/usb/usb_dc.h"
+#include "esp32s3/rom/usb/usb_persist.h"
+#include "esp32s3/rom/usb/chip_usb_dw_wrapper.h"
+
 // Invoked when a DFU_DETACH request is received and bitWillDetach is set
 void tud_dfu_runtime_reboot_to_dfu_cb(void) {
     ESP_LOGI(TAG, "DFU detach request received, rebooting to DFU mode");
 
-    // TODO: Implement reboot to DFU mode
-    //       Longer term we want to do this via a custom app firmware slot (for a custom PID),
+    // TODO: Do we need to clean up our USB thread before rebooting?
+    // TODO: Longer term we want to do this via a custom app firmware slot (for a custom PID),
     //       but the bootloader implementation will do for now.
-    // esp_restart();
+    usb_dc_prepare_persist();
+    chip_usb_set_persist_flags(USBDC_PERSIST_ENA);
+    chip_usb_set_persist_flags(USBDC_BOOT_DFU);
+    REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+    esp_restart();
 }
 
 // End of the esp_tinyusb callbacks
