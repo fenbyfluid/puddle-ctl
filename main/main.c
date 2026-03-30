@@ -50,11 +50,15 @@
 LV_FONT_DECLARE(monogram)
 lv_font_t const *default_font = &monogram;
 
-#define I2C_CLOCK_SPEED 100000 // 100 kHz - need stronger pull-ups for 400 kHz
+#define I2C_CLOCK_SPEED      100000            // 100 kHz - need stronger pull-ups for 400 kHz
 #define OLED_SPI_CLOCK_SPEED (8 * 1000 * 1000) // We should be able to go up to 10 MHz, but it's a little unstable
-#define OLED_SPI_HOST SPI2_HOST
+#define OLED_SPI_HOST        SPI2_HOST
 
 static const char *TAG = "main";
+
+#define ENCODER_CLICK_MAX_MS    300
+#define ENCODER_DOUBLE_CLICK_MS 0   // 350 // Disabled for now as we don't need it and it makes clicks sluggish
+#define ENCODER_LONG_PRESS_MS   350 // 500
 
 const gpio_num_t VSENSOR_EN_GPIO = 7;
 const gpio_num_t ONBOARD_LED_GPIO = 13;
@@ -75,26 +79,41 @@ lv_indev_t *encoder_indevs[ENCODER_COUNT] = {NULL};
 i2c_encoder_handle_t encoder_handles[ENCODER_COUNT] = {NULL};
 is31fl3746a_handle_t ring_handles[ENCODER_COUNT] = {NULL};
 
+typedef struct {
+    i2c_encoder_handle_t encoder;
+    bool is_pressed;
+    bool long_press_sent;
+    bool click_armed;
+    TickType_t press_start_tick;
+    TickType_t last_click_tick;
+} encoder_button_state_t;
+
+static encoder_button_state_t encoder_button_states[ENCODER_COUNT] = {0};
+
 static void lvgl_read_encoder(lv_indev_t *indev, lv_indev_data_t *data) {
-    i2c_encoder_handle_t encoder = lv_indev_get_user_data(indev);
+    encoder_button_state_t *button_state = lv_indev_get_user_data(indev);
+    if (button_state == NULL || button_state->encoder == NULL) {
+        ESP_LOGW(TAG, "Encoder indev user data not initialized");
+        data->enc_diff = 0;
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
+
+    i2c_encoder_handle_t encoder = button_state->encoder;
+    TickType_t now_tick = xTaskGetTickCount();
+
+    if (button_state->click_armed && !button_state->is_pressed) {
+        uint32_t since_last_click_ms = pdTICKS_TO_MS(now_tick - button_state->last_click_tick);
+        if (since_last_click_ms > ENCODER_DOUBLE_CLICK_MS) {
+            lv_indev_send_event(indev, LV_EVENT_SINGLE_CLICKED, NULL);
+            button_state->click_armed = false;
+        }
+    }
 
     int8_t value = 0;
     ESP_ERROR_CHECK(i2c_encoder_read_value(encoder, &value));
 
     data->enc_diff = value;
-
-    uint32_t flags = 0;
-    ESP_ERROR_CHECK(i2c_encoder_poll_status(encoder, &flags));
-
-    bool button_released = false;
-    data->state = lv_indev_get_state(indev);
-
-    if ((flags & STATUS_FLAG_BUTTON_UP) == STATUS_FLAG_BUTTON_UP) {
-        button_released = true;
-        data->state = LV_INDEV_STATE_RELEASED;
-    } else if ((flags & STATUS_FLAG_BUTTON_DOWN) == STATUS_FLAG_BUTTON_DOWN) {
-        data->state = LV_INDEV_STATE_PRESSED;
-    }
 
     // Fire off our own rotary event
     // This isn't quite valid, as the indev-sent ROTARY event param is supposed to be the target object,
@@ -105,10 +124,60 @@ static void lvgl_read_encoder(lv_indev_t *indev, lv_indev_data_t *data) {
         lv_indev_send_event(indev, LV_EVENT_ROTARY, &rotation);
     }
 
-    // This is an even worse hack, but luckily for us LVGL doesn't currently raise any indev events for encoders.
-    // Without us firing this, we need to use groups for even basic handling, which adds a lot of navigation mode complexity.
-    if (button_released) {
+    uint32_t flags = 0;
+    ESP_ERROR_CHECK(i2c_encoder_poll_status(encoder, &flags));
+
+    bool button_down = (flags & STATUS_FLAG_BUTTON_DOWN) == STATUS_FLAG_BUTTON_DOWN;
+    bool button_up = (flags & STATUS_FLAG_BUTTON_UP) == STATUS_FLAG_BUTTON_UP;
+
+    data->state = button_state->is_pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+
+    if (button_down) {
+        button_state->is_pressed = true;
+        button_state->long_press_sent = false;
+        button_state->press_start_tick = now_tick;
+        data->state = LV_INDEV_STATE_PRESSED;
+    }
+
+    // This is all pretty hacky, but luckily for us LVGL doesn't currently raise most indev events for encoders.
+    // Without us firing these, we need to use groups for even basic handling, which adds a lot of navigation mode
+    // complexity.
+
+    if (button_state->is_pressed && !button_state->long_press_sent) {
+        uint32_t held_ms = pdTICKS_TO_MS(now_tick - button_state->press_start_tick);
+        if (held_ms >= ENCODER_LONG_PRESS_MS) {
+            button_state->long_press_sent = true;
+            lv_indev_send_event(indev, LV_EVENT_LONG_PRESSED, NULL);
+        }
+    }
+
+    if (button_up) {
+        bool was_pressed = button_state->is_pressed;
+        uint32_t held_ms = was_pressed ? pdTICKS_TO_MS(now_tick - button_state->press_start_tick) : 0;
+
+        button_state->is_pressed = false;
+        data->state = LV_INDEV_STATE_RELEASED;
+
+        lv_indev_send_event(indev, LV_EVENT_RELEASED, NULL);
         lv_indev_send_event(indev, LV_EVENT_CLICKED, NULL);
+
+        if (was_pressed && held_ms <= ENCODER_CLICK_MAX_MS) {
+            if (button_state->click_armed) {
+                uint32_t since_last_click_ms = pdTICKS_TO_MS(now_tick - button_state->last_click_tick);
+                if (since_last_click_ms <= ENCODER_DOUBLE_CLICK_MS) {
+                    lv_indev_send_event(indev, LV_EVENT_DOUBLE_CLICKED, NULL);
+                    button_state->click_armed = false;
+                } else {
+                    button_state->click_armed = true;
+                    button_state->last_click_tick = now_tick;
+                }
+            } else {
+                button_state->click_armed = true;
+                button_state->last_click_tick = now_tick;
+            }
+        } else {
+            button_state->click_armed = false;
+        }
     }
 }
 
@@ -119,7 +188,8 @@ void init_i2c_bus(void) {
         .scl_io_num = I2C_SCL_GPIO,
         .sda_io_num = I2C_SDA_GPIO,
         .glitch_ignore_cnt = 7,
-        // Our board has 10k pull-up resistors so we don't strictly need this, but it doesn't hurt and avoids a log warning.
+        // Our board has 10k pull-up resistors so we don't strictly need this, but it doesn't hurt and avoids a log
+        // warning.
         .flags.enable_internal_pullup = true,
     };
 
@@ -154,9 +224,7 @@ void init_i2c_bus(void) {
     ESP_LOGI(TAG, "I2C bus and devices initialized");
 }
 
-static uint32_t lvgl_tick_callback(void) {
-    return xTaskGetTickCount() * portTICK_PERIOD_MS;
-}
+static uint32_t lvgl_tick_callback(void) { return xTaskGetTickCount() * portTICK_PERIOD_MS; }
 
 static void lvgl_flush_callback(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
     esp_lcd_panel_handle_t panel_handle = lv_display_get_user_data(disp);
@@ -224,7 +292,9 @@ void display_task_main(void *pvParameters) {
         lv_display_set_flush_cb(display_handles[i], lvgl_flush_callback);
 
         // Use the draw buffer to clear the screen before turning it on.
-        ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, SSD1322_PANEL_WIDTH, SSD1322_PANEL_HEIGHT, draw_buffer));
+        ESP_ERROR_CHECK(
+            esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, SSD1322_PANEL_WIDTH, SSD1322_PANEL_HEIGHT, draw_buffer)
+        );
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
     }
 
@@ -310,13 +380,16 @@ void app_main(void) {
 
     // Create an input device for each encoder
     for (int i = 0; i < ENCODER_COUNT; ++i) {
+        encoder_button_states[i].encoder = encoder_handles[i];
         encoder_indevs[i] = lv_indev_create();
         lv_indev_set_type(encoder_indevs[i], LV_INDEV_TYPE_ENCODER);
-        lv_indev_set_user_data(encoder_indevs[i], encoder_handles[i]);
+        lv_indev_set_user_data(encoder_indevs[i], &encoder_button_states[i]);
         lv_indev_set_read_cb(encoder_indevs[i], lvgl_read_encoder);
     }
 
     ESP_LOGI(TAG, "Hardware initialization complete");
+
+    set_usb_hid_device_info((CONFIG_TINYUSB_DESC_BCD_DEVICE >> 8) & 0xFF, CONFIG_TINYUSB_DESC_BCD_DEVICE & 0xFF, 0x00);
 
     {
         lv_indev_read(encoder_indevs[0]);
@@ -328,6 +401,7 @@ void app_main(void) {
         if (state == LV_INDEV_STATE_RELEASED) {
             xTaskCreatePinnedToCore(usb_task_main, "USB", 8192, NULL, 1, NULL, xPortGetCoreID());
         } else if (state == LV_INDEV_STATE_PRESSED) {
+            // TODO: Indicate this on the screen and/or LEDs in some way
             ESP_LOGI(TAG, "Skipping USB initialization due to button held at boot");
 
             // Switch the USB PHY back to Serial/Jtag mode, disabling OTG support.
@@ -361,8 +435,8 @@ void app_main(void) {
         float used_percent = 100.0f * (total_heap - free_heap) / total_heap;
 
         ESP_LOGI(
-            TAG, "Heap stats: Total = %u, Free = %u, Min Free = %u, Used = %.2f%%",
-            total_heap, free_heap, min_free_heap, used_percent
+            TAG, "Heap stats: Total = %u, Free = %u, Min Free = %u, Used = %.2f%%, Min Block = %u", total_heap,
+            free_heap, min_free_heap, used_percent, heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT)
         );
     }
 }

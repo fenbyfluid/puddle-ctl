@@ -7,30 +7,111 @@
 #include "freertos/task.h"
 
 #include "globals.h"
-#include "mci_helpers.h"
 #include "usb.h"
 
 static const char *TAG = "StateMgr";
 
-bool has_limits = false;
-hid_options_feature_report_t current_limits = {};
+SemaphoreHandle_t input_report_mutex = NULL;
+hid_input_report_t current_input_report = {};
+static bool encoder_long_press_active[ENCODER_COUNT] = {false};
 
-bool has_status = false;
-SemaphoreHandle_t status_mutex = NULL;
-hid_status_input_report_t current_status = {};
+static const uint8_t SCREEN_TYPE_TEXT_LINES = 0;
+static const uint8_t SCREEN_TYPE_MENU = 1;
 
-SemaphoreHandle_t controls_mutex = NULL;
-hid_control_output_report_t current_controls = {};
+// ScreenSpec limits
+#define MAX_SCREEN_LINES 6
+#define MAX_MENU_ITEMS   63
+
+// VariableUpdate limits
+#define MAX_VAR_INDEX    32 // No support for extended format yet
+#define STRING_POOL_SIZE 4096
+
+#define MAX_EVENT_COUNT 28
+
+typedef struct {
+    uint8_t item_id;
+    uint8_t flags;
+    char *label; /* pointer into spec buffer */
+} menu_item_ptr_t;
+
+typedef struct {
+    uint8_t screen_id;
+    /* encoder labels (pointers into spec buffer) */
+    char *encoder_primary[ENCODER_COUNT];
+    char *encoder_secondary[ENCODER_COUNT];
+
+    /* left main area */
+    uint8_t left_top_margin;
+    uint8_t left_type;
+    uint8_t left_line_count;
+    char *left_lines[MAX_SCREEN_LINES];
+    char *left_menu_title;
+    uint8_t left_menu_item_count;
+    menu_item_ptr_t left_menu_items[MAX_MENU_ITEMS];
+
+    /* right main area */
+    uint8_t right_top_margin;
+    uint8_t right_type;
+    uint8_t right_line_count;
+    char *right_lines[MAX_SCREEN_LINES];
+    char *right_menu_title;
+    uint8_t right_menu_item_count;
+    menu_item_ptr_t right_menu_items[MAX_MENU_ITEMS];
+} screen_spec_t;
+
+static char string_pool[STRING_POOL_SIZE];
+static size_t string_pool_head = 0;
+
+typedef enum { VAR_NONE = 0, VAR_FIXEDPOINT = 1, VAR_SHORTSTRING = 2 } var_type_t;
+
+typedef struct {
+    uint32_t seq; /* bump on each update */
+    var_type_t type;
+    union {
+        struct {
+            uint8_t decimals;
+            int16_t value;
+        } fp;
+        char *str; /* pointer into string pool */
+    } u;
+} variable_value_t;
+
+static variable_value_t var_table[MAX_VAR_INDEX];
+
+// Label binding registry: map LVGL labels to their template and referenced var mask
+typedef struct {
+    lv_obj_t *label;
+    const char *tmpl;  /* pointer into current_spec_buffer */
+    uint32_t var_mask; /* bit i set if template references variable i */
+    size_t buf_size;   /* render buffer size */
+    char *buf;         /* allocated render buffer */
+} label_binding_t;
+
+static label_binding_t *label_bindings = NULL;
+static size_t label_binding_count = 0;
+
+/* Assembly state (ordered fragments starting at 0) */
+static uint8_t *assembling_buffer = NULL;
+static int assembling_screen_id = -1;
+static uint8_t assembling_frag_total = 0;
+static uint8_t assembling_next_index = 0;
+
+/* Current parsed spec: pointers reference current_spec_buffer */
+static uint8_t *current_spec_buffer = NULL;
+static screen_spec_t *current_parsed_screen = NULL;
 
 /**
  * @brief Aligns an object near the bottom of the screen, adjusting its position to align with the rotary encoder
  * center.
  */
-void align_encoder_center(lv_obj_t *object, int32_t y_offset, bool right_screen, bool right_encoder) {
+void align_encoder_center(lv_obj_t *object, int32_t y_offset, uint8_t encoder_idx) {
     static const int32_t LEFT_SCREEN_LEFT_ENCODER_OFFSET = 17;
     static const int32_t LEFT_SCREEN_RIGHT_ENCODER_OFFSET = 107;
     static const int32_t RIGHT_SCREEN_LEFT_ENCODER_OFFSET = 21;
     static const int32_t RIGHT_SCREEN_RIGHT_ENCODER_OFFSET = 111;
+
+    bool right_screen = (encoder_idx >= ENCODER_COUNT / 2);
+    bool right_encoder = (encoder_idx % 2 == 1);
 
     if (right_encoder) {
         lv_obj_align(object, LV_ALIGN_BOTTOM_RIGHT, 0, y_offset);
@@ -66,409 +147,733 @@ void display_splash_screens(void) {
     lv_obj_center(label_right);
 }
 
-void set_initial_controls() {
-    xSemaphoreTake(controls_mutex, portMAX_DELAY);
-    current_controls.stopped = false;
-    current_controls.start_position = 0;
-    current_controls.end_position = 0;
-    current_controls.direction_change_tolerance = 10000; // 1mm
-    current_controls.forwards_velocity = 50000;          // 0.05 m/s
-    current_controls.forwards_acceleration = 10000;      // 0.1 m/s^2
-    current_controls.forwards_deceleration = current_controls.forwards_acceleration;
-    current_controls.backwards_velocity = current_controls.forwards_velocity;
-    current_controls.backwards_acceleration = current_controls.forwards_acceleration;
-    current_controls.backwards_deceleration = current_controls.forwards_acceleration;
-    xSemaphoreGive(controls_mutex);
+/* Clear and free all label bindings (call when screen is replaced) */
+static void clear_label_bindings(void) {
+    if (!label_bindings)
+        return;
+    for (size_t i = 0; i < label_binding_count; ++i) {
+        free(label_bindings[i].buf);
+        label_bindings[i].buf = NULL;
+    }
+    free(label_bindings);
+    label_bindings = NULL;
+    label_binding_count = 0;
 }
 
-void update_led_rings(uint8_t dirty_rings) {
-    if (dirty_rings == 0 || !has_limits) {
+/* Register a label for future variable-driven updates. If tmpl contains no variables, registration is skipped. */
+static void register_label_binding(lv_obj_t *label, const char *tmpl, size_t buf_size) {
+    if (!tmpl || tmpl[0] == '\0' || !label)
         return;
+
+    uint32_t mask = 0;
+    const char *s = tmpl;
+    while (*s) {
+        if (*s == '{') {
+            const char *q = s + 1;
+            int idx = 0;
+            bool found = false;
+            while (*q >= '0' && *q <= '9') {
+                idx = idx * 10 + (*q - '0');
+                q++;
+            }
+            if (*q == '}')
+                found = true;
+            if (found && idx >= 0 && idx < (int)MAX_VAR_INDEX) {
+                mask |= (1u << idx);
+            }
+            if (found)
+                s = q + 1;
+            else
+                s++;
+        } else {
+            s++;
+        }
     }
 
-    // TODO: Provide these ring to value mappings externally
-    xSemaphoreTake(controls_mutex, portMAX_DELAY);
-    float ring_values_pct[4] = {
-        current_controls.start_position / (float)current_limits.stroke_limit,
-        current_controls.end_position / (float)current_limits.stroke_limit,
-        current_controls.forwards_velocity / (float)current_limits.velocity_limit,
-        current_controls.forwards_acceleration / (float)current_limits.acceleration_limit,
-    };
-    xSemaphoreGive(controls_mutex);
+    if (mask == 0)
+        return; /* no vars referenced -> no need to re-render */
+
+    label_bindings = realloc(label_bindings, sizeof(label_binding_t) * (label_binding_count + 1));
+    if (!label_bindings)
+        return;
+    label_bindings[label_binding_count].label = label;
+    label_bindings[label_binding_count].tmpl = tmpl;
+    label_bindings[label_binding_count].var_mask = mask;
+    label_bindings[label_binding_count].buf_size = buf_size;
+    label_bindings[label_binding_count].buf = malloc(buf_size);
+    if (label_bindings[label_binding_count].buf)
+        label_bindings[label_binding_count].buf[0] = '\0';
+    label_binding_count++;
+}
+
+/* Ensure label bindings cleared when current parsed screen is freed */
+static void free_current_parsed_screen(void) {
+    if (current_parsed_screen) {
+        free(current_parsed_screen);
+        current_parsed_screen = NULL;
+    }
+    free(current_spec_buffer);
+    current_spec_buffer = NULL;
+
+    /* remove and free any label bindings from previous screen */
+    xSemaphoreTake(lvgl_mutex, portMAX_DELAY);
+    clear_label_bindings();
+    xSemaphoreGive(lvgl_mutex);
+}
+
+/* Parse a "main area" in-place. Advances *p; writes outputs into provided arrays. */
+static void parse_main_area_inplace(
+    const uint8_t **p, const uint8_t *end, uint8_t *out_type, uint8_t *out_top_margin, uint8_t *out_line_count,
+    char *out_lines[MAX_SCREEN_LINES], char **out_menu_title, uint8_t *out_item_count,
+    menu_item_ptr_t out_items[MAX_MENU_ITEMS]
+) {
+    if (*p >= end) {
+        *out_type = 0;
+        *out_top_margin = 0;
+        *out_line_count = 0;
+        *out_item_count = 0;
+        return;
+    }
+    uint8_t type = (uint8_t)*(*p)++;
+    *out_type = type;
+
+    /* Read top margin that's part of the body for TextLines and Menu */
+    if (*p < end) {
+        *out_top_margin = (uint8_t)*(*p)++;
+    } else {
+        *out_top_margin = 0;
+    }
+
+    if (type == SCREEN_TYPE_TEXT_LINES) { /* TextLines */
+        if (*p >= end) {
+            *out_line_count = 0;
+            return;
+        }
+        uint8_t orig_line_count = (uint8_t)*(*p)++;
+        *out_line_count = 0;
+        for (uint8_t i = 0; i < orig_line_count; ++i) {
+            const uint8_t *start = *p;
+            while (*p < end && **p != '\0')
+                (*p)++;
+            if (i < MAX_SCREEN_LINES) {
+                out_lines[*out_line_count] = (char *)start;
+                (*out_line_count)++;
+            }
+            if (*p < end)
+                (*p)++;
+            else
+                break;
+        }
+    } else if (type == SCREEN_TYPE_MENU) { /* Menu */
+        const uint8_t *title_start = *p;
+        while (*p < end && **p != '\0')
+            (*p)++;
+        *out_menu_title = (char *)title_start;
+        if (*p < end)
+            (*p)++;
+        if (*p >= end) {
+            *out_item_count = 0;
+            return;
+        }
+        uint8_t orig_item_count = (uint8_t)*(*p)++;
+        *out_item_count = 0;
+        for (uint8_t i = 0; i < orig_item_count; ++i) {
+            if ((size_t)(end - *p) < 2) {
+                break;
+            }
+            uint8_t item_id = (uint8_t)*(*p)++;
+            uint8_t flags = (uint8_t)*(*p)++;
+            const uint8_t *lbl_start = *p;
+            while (*p < end && **p != '\0')
+                (*p)++;
+            if (i < MAX_MENU_ITEMS) {
+                out_items[*out_item_count].item_id = item_id;
+                out_items[*out_item_count].flags = flags;
+                out_items[*out_item_count].label = (char *)lbl_start;
+                (*out_item_count)++;
+            }
+            if (*p < end)
+                (*p)++;
+            else
+                break;
+        }
+    } else {
+        /* Unknown/future type: no-op (leave counts zero) */
+        *out_line_count = 0;
+        *out_item_count = 0;
+    }
+}
+
+/* Parse entire reassembled payload in-place. Returns heap-allocated screen_spec_t (pointers into buf). */
+static screen_spec_t *parse_screen_spec_inplace(uint8_t screen_id, uint8_t *buf, size_t size) {
+    const uint8_t *p = buf;
+    const uint8_t *end = buf + size;
+    screen_spec_t *spec = (screen_spec_t *)calloc(1, sizeof(screen_spec_t));
+    spec->screen_id = screen_id;
 
     for (int i = 0; i < ENCODER_COUNT; ++i) {
-        if ((dirty_rings & (1 << i)) == 0) {
-            continue;
+        const uint8_t *start = p;
+        while (p < end && *p != '\0')
+            p++;
+        spec->encoder_primary[i] = (char *)start;
+        if (p < end)
+            p++;
+        else {
+            spec->encoder_primary[i] = (char *)start;
+            break;
         }
 
-        for (int j = 0; j < IS31FL3746A_LED_COUNT; ++j) {
-            float led_position = (j + 1.0f) / IS31FL3746A_LED_COUNT;
-            float led_bottom = j / (float)IS31FL3746A_LED_COUNT;
-
-            uint8_t brightness = 0;
-            if (ring_values_pct[i] >= led_position) {
-                brightness = 255;
-            } else if (ring_values_pct[i] > led_bottom) {
-                float normalized = (ring_values_pct[i] - led_bottom) / (led_position - led_bottom);
-
-                brightness = (uint8_t)((0.5f + (normalized * 0.4f)) * 255.0f);
-            }
-
-            is31fl3746a_set_led_color(ring_handles[i], j, brightness, brightness, brightness);
+        start = p;
+        while (p < end && *p != '\0')
+            p++;
+        spec->encoder_secondary[i] = (char *)start;
+        if (p < end)
+            p++;
+        else {
+            spec->encoder_secondary[i] = (char *)start;
+            break;
         }
-
-        is31fl3746a_flush_led_color(ring_handles[i]);
-    }
-}
-
-typedef enum {
-    ENC_BUTTON_ENABLE_DISABLE,
-    ENC_BUTTON_FREEZE_UNFREEZE,
-    ENC_BUTTON_OPEN_MENU,
-    ENC_BUTTON_ZERO_POSITION,
-} encoder_button_action_t;
-
-void on_encoder_button_click(lv_event_t *event) {
-    encoder_button_action_t *action = (encoder_button_action_t *)lv_event_get_user_data(event);
-
-    switch (*action) {
-    case ENC_BUTTON_ENABLE_DISABLE:
-        ESP_LOGI(TAG, "Enable/Disable button clicked");
-        xSemaphoreTake(controls_mutex, portMAX_DELAY);
-        current_controls.enabled = !current_controls.enabled;
-        xSemaphoreGive(controls_mutex);
-        break;
-    case ENC_BUTTON_FREEZE_UNFREEZE:
-        ESP_LOGI(TAG, "Freeze/Unfreeze button clicked");
-        xSemaphoreTake(controls_mutex, portMAX_DELAY);
-        current_controls.stopped = !current_controls.stopped;
-        xSemaphoreGive(controls_mutex);
-        break;
-    case ENC_BUTTON_OPEN_MENU:
-        ESP_LOGI(TAG, "Restart button clicked, restarting system");
-        esp_restart();
-        break;
-    case ENC_BUTTON_ZERO_POSITION:
-        ESP_LOGI(TAG, "Zero Position button clicked");
-        set_initial_controls();
-        update_led_rings(0xFF);
-        break;
-    default:
-        ESP_LOGW(TAG, "Unknown encoder button action %d", *action);
-        break;
-    }
-}
-
-typedef enum {
-    ENC_ROTATION_START,
-    ENC_ROTATION_END,
-    ENC_ROTATION_VELOCITY,
-    ENC_ROTATION_ACCELERATION,
-} encoder_rotation_action_t;
-
-void on_encoder_rotation(lv_event_t *event) {
-    int32_t rotation = lv_event_get_rotary_diff(event);
-    int32_t change = rotation * abs(rotation);
-
-    xSemaphoreTake(controls_mutex, portMAX_DELAY);
-
-    encoder_rotation_action_t *action = (encoder_rotation_action_t *)lv_event_get_user_data(event);
-
-    uint8_t dirty_rings = 0;
-
-    switch (*action) {
-    case ENC_ROTATION_START:
-        dirty_rings |= 1 << 0;
-        current_controls.start_position += change * 10000;
-        if (current_controls.start_position < 0)
-            current_controls.start_position = 0;
-        if (has_limits && current_controls.start_position > current_limits.stroke_limit)
-            current_controls.start_position = current_limits.stroke_limit;
-        if (current_controls.start_position > current_controls.end_position) {
-            dirty_rings |= 1 << 1;
-            current_controls.end_position = current_controls.start_position;
-        };
-        break;
-    case ENC_ROTATION_END:
-        dirty_rings |= 1 << 1;
-        current_controls.end_position += change * 10000;
-        if (current_controls.end_position < 0)
-            current_controls.end_position = 0;
-        if (current_controls.end_position < current_controls.start_position) {
-            dirty_rings |= 1 << 0;
-            current_controls.start_position = current_controls.end_position;
-        }
-        if (has_limits && current_controls.end_position > current_limits.stroke_limit)
-            current_controls.end_position = current_limits.stroke_limit;
-        break;
-    case ENC_ROTATION_VELOCITY:
-        dirty_rings |= 1 << 2;
-        current_controls.forwards_velocity += change * 10000;
-        if (current_controls.forwards_velocity < 0)
-            current_controls.forwards_velocity = 0;
-        if (has_limits && current_controls.forwards_velocity > current_limits.velocity_limit)
-            current_controls.forwards_velocity = current_limits.velocity_limit;
-        current_controls.backwards_velocity = current_controls.forwards_velocity;
-        break;
-    case ENC_ROTATION_ACCELERATION:
-        dirty_rings |= 1 << 3;
-        current_controls.forwards_acceleration += change * abs(rotation) * 1000;
-        if (current_controls.forwards_acceleration < 0)
-            current_controls.forwards_acceleration = 0;
-        if (has_limits && current_controls.forwards_acceleration > current_limits.acceleration_limit)
-            current_controls.forwards_acceleration = current_limits.acceleration_limit;
-        current_controls.forwards_deceleration = current_controls.forwards_acceleration;
-        current_controls.backwards_acceleration = current_controls.forwards_acceleration;
-        current_controls.backwards_deceleration = current_controls.forwards_acceleration;
-        break;
-    default:
-        ESP_LOGW(TAG, "Unknown encoder rotation action %d", *action);
-        break;
     }
 
-    xSemaphoreGive(controls_mutex);
-
-    update_led_rings(dirty_rings);
-}
-
-typedef struct {
-    lv_obj_t *enable_disable_label;
-    lv_obj_t *freeze_unfreeze_label;
-    lv_obj_t *left_info_label;
-    lv_obj_t *right_info_label;
-} control_ui_update_context_t;
-
-#define SYMBOL_LEFT_ARROW  "\xE2\x97\x80"
-#define SYMBOL_RIGHT_ARROW "\xE2\x96\xB6"
-
-void update_controls_ui(lv_event_t *event) {
-    control_ui_update_context_t *context = (control_ui_update_context_t *)lv_event_get_user_data(event);
-
-    // Left screen
-
-    xSemaphoreTake(controls_mutex, portMAX_DELAY);
-
-    bool enabled = current_controls.enabled;
-    bool stopped = current_controls.stopped;
-
-    float start_position = current_controls.start_position / 10000.0f;
-    float end_position = current_controls.end_position / 10000.0f;
-    float backwards_velocity = current_controls.backwards_velocity / 1000000.0f;
-    float forwards_velocity = current_controls.forwards_velocity / 1000000.0f;
-    float backwards_acceleration = current_controls.backwards_acceleration / 100000.0f;
-    float forwards_acceleration = current_controls.forwards_acceleration / 100000.0f;
-
-    xSemaphoreGive(controls_mutex);
-
-    // TODO: Scale dynamically based on magnitude
-    char info_text[256];
-    snprintf(
-        info_text, sizeof(info_text),
-        "Stroke " SYMBOL_LEFT_ARROW " %4.0f %4.0f " SYMBOL_RIGHT_ARROW "\n"
-        " Speed " SYMBOL_LEFT_ARROW " %3.2f %3.2f " SYMBOL_RIGHT_ARROW "\n"
-        "Accel. " SYMBOL_LEFT_ARROW " %3.2f %3.2f " SYMBOL_RIGHT_ARROW "",
-        start_position, end_position,
-        backwards_velocity, forwards_velocity,
-        backwards_acceleration, forwards_acceleration
+    parse_main_area_inplace(
+        &p, end, &spec->left_type, &spec->left_top_margin, &spec->left_line_count, spec->left_lines,
+        &spec->left_menu_title, &spec->left_menu_item_count, spec->left_menu_items
     );
 
-    lv_label_set_text_static(context->enable_disable_label, enabled ? "Disable" : "Enable");
-    align_encoder_center(context->enable_disable_label, -10, false, false);
-
-    lv_label_set_text_static(context->freeze_unfreeze_label, stopped ? "Unfreeze" : "Freeze");
-    align_encoder_center(context->freeze_unfreeze_label, -10, false, true);
-
-    lv_label_set_text(context->left_info_label, info_text);
-    lv_obj_align(context->left_info_label, LV_ALIGN_TOP_MID, 0, 7);
-
-    // Right screen
-
-    if (!has_status) {
-        lv_label_set_text_static(context->right_info_label, "NOT CONNECTED");
-        lv_obj_align(context->right_info_label, LV_ALIGN_TOP_MID, 0, 11);
-
-        return;
-    }
-
-    xSemaphoreTake(status_mutex, portMAX_DELAY);
-
-    uint8_t main_state = current_status.main_state;
-    float actual_position = current_status.actual_position / 10000.0f;
-    float demand_position = current_status.demand_position / 10000.0f;
-    float current = current_status.current / 1000.0f;
-    uint16_t warning_flags = current_status.warning_flags;
-    uint16_t error_code = current_status.error_code;
-
-    xSemaphoreGive(status_mutex);
-
-    if (error_code != 0) {
-        snprintf(info_text, sizeof(info_text), "ERROR\n%s", mci_error_code_to_name(error_code));
-
-        lv_label_set_text(context->right_info_label, info_text);
-        lv_obj_align(context->right_info_label, LV_ALIGN_TOP_MID, 0, 11);
-        return;
-    }
-
-    snprintf(
-        info_text, sizeof(info_text),
-        "%s\n"
-        "%4.0f / %4.0f mm\n",
-        mci_state_to_name(main_state), actual_position, demand_position
+    parse_main_area_inplace(
+        &p, end, &spec->right_type, &spec->right_top_margin, &spec->right_line_count, spec->right_lines,
+        &spec->right_menu_title, &spec->right_menu_item_count, spec->right_menu_items
     );
 
-    if (warning_flags != 0) {
-        format_mci_warning_flags(
-            warning_flags, ", ", info_text + strlen(info_text), sizeof(info_text) - strlen(info_text)
+    return spec;
+}
+
+static void log_screen_spec(const screen_spec_t *spec) {
+    if (!spec)
+        return;
+
+    ESP_LOGD(TAG, "ScreenSpec id=%d", spec->screen_id);
+
+    for (int i = 0; i < ENCODER_COUNT; ++i) {
+        ESP_LOGD(
+            TAG, "  Encoder %d primary='%s' secondary='%s'", i,
+            spec->encoder_primary[i] ? spec->encoder_primary[i] : "",
+            spec->encoder_secondary[i] ? spec->encoder_secondary[i] : ""
         );
-    } else {
-        snprintf(info_text + strlen(info_text), sizeof(info_text) - strlen(info_text), "%02.2f A", current);
     }
 
-    lv_label_set_text(context->right_info_label, info_text);
-    lv_obj_align(context->right_info_label, LV_ALIGN_TOP_MID, 0, 11);
+    ESP_LOGD(TAG, "  Left type=%d", spec->left_type);
+    ESP_LOGD(TAG, "    Left top_margin=%d", spec->left_top_margin);
+    if (spec->left_type == SCREEN_TYPE_TEXT_LINES) {
+        for (int i = 0; i < spec->left_line_count; ++i) {
+            ESP_LOGD(TAG, "    Left line %d: '%s'", i, spec->left_lines[i] ? spec->left_lines[i] : "");
+        }
+    } else if (spec->left_type == SCREEN_TYPE_MENU) {
+        ESP_LOGD(TAG, "    Title: '%s'", spec->left_menu_title ? spec->left_menu_title : "");
+        for (int i = 0; i < spec->left_menu_item_count; ++i) {
+            ESP_LOGD(
+                TAG, "    Item %d id=%d flags=0x%02x label='%s'", i, spec->left_menu_items[i].item_id,
+                spec->left_menu_items[i].flags, spec->left_menu_items[i].label ? spec->left_menu_items[i].label : ""
+            );
+        }
+    }
+
+    ESP_LOGD(TAG, "  Right type=%d", spec->right_type);
+    ESP_LOGD(TAG, "    Right top_margin=%d", spec->right_top_margin);
+    if (spec->right_type == SCREEN_TYPE_TEXT_LINES) {
+        for (int i = 0; i < spec->right_line_count; ++i) {
+            ESP_LOGD(TAG, "    Right line %d: '%s'", i, spec->right_lines[i] ? spec->right_lines[i] : "");
+        }
+    } else if (spec->right_type == SCREEN_TYPE_MENU) {
+        ESP_LOGD(TAG, "    Title: '%s'", spec->right_menu_title ? spec->right_menu_title : "");
+        for (int i = 0; i < spec->right_menu_item_count; ++i) {
+            ESP_LOGD(
+                TAG, "    Item %d id=%d flags=0x%02x label='%s'", i, spec->right_menu_items[i].item_id,
+                spec->right_menu_items[i].flags, spec->right_menu_items[i].label ? spec->right_menu_items[i].label : ""
+            );
+        }
+    }
 }
 
-void display_main_screens(void) {
-    // Left screen
+/* Render a template string with {N} placeholders into buf.
+   Template pointer is into current_spec_buffer (null-terminated).
+   Returns required length (may exceed buf_size). */
+static size_t render_template_to_buf(const char *tmpl, char *buf, size_t buf_size) {
+    const char *s = tmpl;
+    size_t out = 0;
+    char tmp[64];
 
-    lv_display_set_default(display_handles[0]);
-    lv_obj_t *left_screen = lv_obj_create(NULL);
-    lv_obj_clear_flag(left_screen, LV_OBJ_FLAG_SCROLLABLE);
+    while (*s) {
+        if (*s == '{') {
+            /* parse number until '}' */
+            const char *q = s + 1;
+            int idx = 0;
+            if (*q == '\0') { /* stray '{' */
+                q = s;
+            } else {
+                while (*q >= '0' && *q <= '9') {
+                    idx = idx * 10 + (*q - '0');
+                    q++;
+                }
+                if (*q == '}') {
+                    /* substitute variable idx */
+                    if ((unsigned)idx < MAX_VAR_INDEX && var_table[idx].type != VAR_NONE) {
+                        if (var_table[idx].type == VAR_SHORTSTRING && var_table[idx].u.str) {
+                            size_t l = strlen(var_table[idx].u.str);
+                            if (out + l < buf_size)
+                                memcpy(buf + out, var_table[idx].u.str, l);
+                            out += l;
+                        } else if (var_table[idx].type == VAR_FIXEDPOINT) {
+                            int16_t v = var_table[idx].u.fp.value;
+                            uint8_t dec = var_table[idx].u.fp.decimals;
+                            if (dec == 0) {
+                                int rv = snprintf(tmp, sizeof(tmp), "%d", (int)v);
+                                if (rv > 0) {
+                                    size_t l = (size_t)rv;
+                                    if (out + l < buf_size)
+                                        memcpy(buf + out, tmp, l);
+                                    out += l;
+                                }
+                            } else {
+                                int sign = v < 0 ? -1 : 1;
+                                int32_t absv = v * sign;
+                                int32_t scale = 1;
+                                for (uint8_t d = 0; d < dec; ++d)
+                                    scale *= 10;
+                                int32_t intpart = absv / scale;
+                                int32_t frac = absv % scale;
+                                if (sign < 0)
+                                    intpart = -intpart;
+                                int rv = snprintf(tmp, sizeof(tmp), "%d.%0*d", (int)intpart, dec, (int)frac);
+                                if (rv > 0) {
+                                    size_t l = (size_t)rv;
+                                    if (out + l < buf_size)
+                                        memcpy(buf + out, tmp, l);
+                                    out += l;
+                                }
+                            }
+                        }
+                    }
+                    s = q + 1;
+                    continue;
+                }
+            }
+            /* if we reach here, treat '{' as literal */
+            if (out + 1 < buf_size)
+                buf[out] = *s;
+            out++;
+            s++;
+        } else {
+            if (out + 1 < buf_size)
+                buf[out] = *s;
+            out++;
+            s++;
+        }
+    }
 
-    lv_obj_t *left_screen_left_rotation_label = lv_label_create(left_screen);
-    lv_label_set_text(left_screen_left_rotation_label, "Start");
-    align_encoder_center(left_screen_left_rotation_label, 0, false, false);
-
-    lv_obj_t *left_screen_left_button_label = lv_label_create(left_screen);
-    lv_label_set_text(left_screen_left_button_label, "Disable");
-    align_encoder_center(left_screen_left_button_label, -10, false, false);
-
-    lv_obj_t *left_screen_right_rotation_label = lv_label_create(left_screen);
-    lv_label_set_text(left_screen_right_rotation_label, "End");
-    align_encoder_center(left_screen_right_rotation_label, 0, false, true);
-
-    lv_obj_t *left_screen_right_button_label = lv_label_create(left_screen);
-    lv_label_set_text(left_screen_right_button_label, "Freeze");
-    align_encoder_center(left_screen_right_button_label, -10, false, true);
-
-    lv_obj_t *left_screen_info_label = lv_label_create(left_screen);
-    lv_label_set_text(left_screen_info_label, "");
-    lv_obj_align(left_screen_info_label, LV_ALIGN_TOP_MID, 0, 0);
-
-    lv_screen_load_anim(left_screen, LV_SCREEN_LOAD_ANIM_MOVE_TOP, 500, 0, true);
-
-    // Right screen
-
-    lv_display_set_default(display_handles[1]);
-    lv_obj_t *right_screen = lv_obj_create(NULL);
-    lv_obj_clear_flag(right_screen, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *right_screen_left_rotation_label = lv_label_create(right_screen);
-    lv_label_set_text(right_screen_left_rotation_label, "Speed");
-    align_encoder_center(right_screen_left_rotation_label, 0, true, false);
-
-    lv_obj_t *right_screen_left_button_label = lv_label_create(right_screen);
-    lv_label_set_text(right_screen_left_button_label, "Menu");
-    align_encoder_center(right_screen_left_button_label, -10, true, false);
-
-    lv_obj_t *right_screen_right_rotation_label = lv_label_create(right_screen);
-    lv_label_set_text(right_screen_right_rotation_label, "Accel.");
-    align_encoder_center(right_screen_right_rotation_label, 0, true, true);
-
-    lv_obj_t *right_screen_right_button_label = lv_label_create(right_screen);
-    lv_label_set_text(right_screen_right_button_label, "Zero");
-    align_encoder_center(right_screen_right_button_label, -10, true, true);
-
-    lv_obj_t *right_screen_info_label = lv_label_create(right_screen);
-    lv_label_set_text(right_screen_info_label, "");
-    lv_obj_set_style_text_align(right_screen_info_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(right_screen_info_label, LV_ALIGN_TOP_MID, 0, 0);
-
-    lv_screen_load_anim(right_screen, LV_SCREEN_LOAD_ANIM_MOVE_TOP, 500, 0, true);
-
-    // Update the UI whenever the screen is refreshed
-    control_ui_update_context_t *context = malloc(sizeof(control_ui_update_context_t));
-    context->enable_disable_label = left_screen_left_button_label;
-    context->freeze_unfreeze_label = left_screen_right_button_label;
-    context->left_info_label = left_screen_info_label;
-    context->right_info_label = right_screen_info_label;
-    lv_display_add_event_cb(display_handles[0], update_controls_ui, LV_EVENT_REFR_START, context);
-
-    // TODO: Make these bindings configurable.
-    // Encoder 1: Start Position, Enable/Disable on click
-    // Encoder 2: End Position, Freeze/Unfreeze on click
-    // Encoder 3: Velocity, Open Menu on click
-    // Encoder 4: Acceleration, Zero Position on click
-
-    encoder_rotation_action_t *rotation_action = malloc(sizeof(encoder_rotation_action_t));
-    *rotation_action = ENC_ROTATION_START;
-    lv_indev_add_event_cb(encoder_indevs[0], on_encoder_rotation, LV_EVENT_ROTARY, rotation_action);
-    encoder_button_action_t *button_action = malloc(sizeof(encoder_button_action_t));
-    *button_action = ENC_BUTTON_ENABLE_DISABLE;
-    lv_indev_add_event_cb(encoder_indevs[0], on_encoder_button_click, LV_EVENT_CLICKED, button_action);
-
-    rotation_action = malloc(sizeof(encoder_rotation_action_t));
-    *rotation_action = ENC_ROTATION_END;
-    lv_indev_add_event_cb(encoder_indevs[1], on_encoder_rotation, LV_EVENT_ROTARY, rotation_action);
-    button_action = malloc(sizeof(encoder_button_action_t));
-    *button_action = ENC_BUTTON_FREEZE_UNFREEZE;
-    lv_indev_add_event_cb(encoder_indevs[1], on_encoder_button_click, LV_EVENT_CLICKED, button_action);
-
-    rotation_action = malloc(sizeof(encoder_rotation_action_t));
-    *rotation_action = ENC_ROTATION_VELOCITY;
-    lv_indev_add_event_cb(encoder_indevs[2], on_encoder_rotation, LV_EVENT_ROTARY, rotation_action);
-    button_action = malloc(sizeof(encoder_button_action_t));
-    *button_action = ENC_BUTTON_OPEN_MENU;
-    lv_indev_add_event_cb(encoder_indevs[2], on_encoder_button_click, LV_EVENT_CLICKED, button_action);
-
-    rotation_action = malloc(sizeof(encoder_rotation_action_t));
-    *rotation_action = ENC_ROTATION_ACCELERATION;
-    lv_indev_add_event_cb(encoder_indevs[3], on_encoder_rotation, LV_EVENT_ROTARY, rotation_action);
-    button_action = malloc(sizeof(encoder_button_action_t));
-    *button_action = ENC_BUTTON_ZERO_POSITION;
-    lv_indev_add_event_cb(encoder_indevs[3], on_encoder_button_click, LV_EVENT_CLICKED, button_action);
+    if (buf_size > 0) {
+        size_t to_write = (out < buf_size - 1) ? out : (buf_size - 1);
+        buf[to_write] = '\0';
+    }
+    return out;
 }
 
-void on_usb_hid_options_report(const hid_options_feature_report_t *report) {
-    ESP_LOGI(
-        TAG, "Received HID options report: stroke_limit=%d, velocity_limit=%d, acceleration_limit=%d",
-        report->stroke_limit, report->velocity_limit, report->acceleration_limit
-    );
+/* Re-render and update all labels whose var_mask intersects dirty_mask.
+   Caller must hold lvgl_mutex. */
+static void update_bound_labels(uint32_t dirty_mask) {
+    if (dirty_mask == 0 || label_binding_count == 0)
+        return;
 
-    memcpy(&current_limits, report, sizeof(hid_options_feature_report_t));
-    has_limits = true;
-
-    // Setup reasonable default controls
-    set_initial_controls();
-    update_led_rings(0xFF);
+    for (size_t i = 0; i < label_binding_count; ++i) {
+        label_binding_t *b = &label_bindings[i];
+        if ((b->var_mask & dirty_mask) == 0)
+            continue;
+        if (!b->buf || !b->tmpl || !b->label)
+            continue;
+        render_template_to_buf(b->tmpl, b->buf, b->buf_size);
+        lv_label_set_text(b->label, b->buf);
+    }
 }
 
-void on_usb_hid_status_report(const hid_status_input_report_t *report) {
-    if (!report) {
-        // TODO: It shouldn't be possible to return to this state after having received a valid report
-        has_status = false;
+static void display_screen_spec_side(const screen_spec_t *spec, bool right_side) {
+    int display_index = right_side ? 1 : 0;
+    lv_display_set_default(display_handles[display_index]);
 
-        ESP_LOGW(TAG, "Received NULL HID status report");
+    lv_obj_t *screen = lv_obj_create(NULL);
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+
+    int enc_start = right_side ? (ENCODER_COUNT / 2) : 0;
+    int enc_end = right_side ? ENCODER_COUNT : (ENCODER_COUNT / 2);
+
+    for (int enc = enc_start; enc < enc_end; ++enc) {
+        lv_obj_t *rot_label = lv_label_create(screen);
+        const char *tmpl = (spec->encoder_primary[enc]) ? spec->encoder_primary[enc] : "";
+        char tmp[64];
+        render_template_to_buf(tmpl, tmp, sizeof(tmp));
+        lv_label_set_text(rot_label, tmp);
+        register_label_binding(rot_label, tmpl, sizeof(tmp));
+        align_encoder_center(rot_label, 0, enc);
+
+        lv_obj_t *btn_label = lv_label_create(screen);
+        const char *tmpl2 = (spec->encoder_secondary[enc]) ? spec->encoder_secondary[enc] : "";
+        char tmp2[64];
+        render_template_to_buf(tmpl2, tmp2, sizeof(tmp2));
+        lv_label_set_text(btn_label, tmp2);
+        register_label_binding(btn_label, tmpl2, sizeof(tmp2));
+        align_encoder_center(btn_label, -10, enc);
+    }
+
+    lv_obj_t *container = lv_obj_create(screen);
+    lv_obj_clear_flag(container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_style_all(container);
+
+    uint8_t type = right_side ? spec->right_type : spec->left_type;
+    uint8_t line_count = right_side ? spec->right_line_count : spec->left_line_count;
+    char *const *text_lines = right_side ? spec->right_lines : spec->left_lines;
+    char *menu_title = right_side ? spec->right_menu_title : spec->left_menu_title;
+    uint8_t item_count = right_side ? spec->right_menu_item_count : spec->left_menu_item_count;
+    const menu_item_ptr_t *menu_items = right_side ? spec->right_menu_items : spec->left_menu_items;
+
+    if (type == SCREEN_TYPE_TEXT_LINES) {
+        for (int i = 0; i < line_count; ++i) {
+            if (!text_lines[i] || text_lines[i][0] == '\0')
+                continue;
+
+            lv_obj_t *line = lv_label_create(container);
+
+            char linebuf[128];
+            render_template_to_buf(text_lines[i], linebuf, sizeof(linebuf));
+            lv_label_set_text(line, linebuf);
+            register_label_binding(line, text_lines[i], sizeof(linebuf));
+
+            lv_obj_align(line, LV_ALIGN_TOP_MID, 0, i * 11);
+        }
+    } else if (type == SCREEN_TYPE_MENU) {
+        if (menu_title) {
+            lv_obj_t *title = lv_label_create(container);
+
+            char linebuf[128];
+            render_template_to_buf(menu_title, linebuf, sizeof(linebuf));
+            lv_label_set_text(title, linebuf);
+            register_label_binding(title, menu_title, sizeof(linebuf));
+
+            lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+        }
+
+        // TODO: Make this a real menu with selectable items
+        for (int i = 0; i < item_count; ++i) {
+            if (!menu_items[i].label || menu_items[i].label[0] == '\0')
+                continue;
+
+            lv_obj_t *item = lv_label_create(container);
+
+            char linebuf[128];
+            render_template_to_buf(menu_items[i].label, linebuf, sizeof(linebuf));
+            lv_label_set_text(item, linebuf);
+            register_label_binding(item, menu_items[i].label, sizeof(linebuf));
+
+            lv_obj_align(item, LV_ALIGN_TOP_MID, 0, (11 + 4) + i * 11);
+        }
+    }
+
+    uint8_t top_margin = right_side ? spec->right_top_margin : spec->left_top_margin;
+    lv_obj_align(container, LV_ALIGN_TOP_MID, 0, top_margin);
+
+    lv_screen_load_anim(screen, LV_SCREEN_LOAD_ANIM_MOVE_TOP, 300, 0, true);
+}
+
+static void display_screen_spec(const screen_spec_t *spec) {
+    if (!spec)
+        return;
+
+    log_screen_spec(spec);
+
+    /* Left display */
+    display_screen_spec_side(spec, false);
+
+    /* Right display */
+    display_screen_spec_side(spec, true);
+}
+
+void set_led_ring_value(uint8_t ring_index, uint8_t value) {
+    if (ring_index >= ENCODER_COUNT) {
+        ESP_LOGW(TAG, "Attempted to set LED ring value for invalid ring index %d", ring_index);
         return;
     }
 
+    for (int i = 0; i < IS31FL3746A_LED_COUNT; ++i) {
+        uint32_t lhs = (uint32_t)value * (uint32_t)IS31FL3746A_LED_COUNT;
+        uint32_t top = UINT8_MAX * (uint32_t)(i + 1);
+        uint32_t bottom = UINT8_MAX * (uint32_t)i;
+
+        uint8_t brightness = 0;
+        if (lhs >= top) {
+            brightness = UINT8_MAX;
+        } else if (lhs > bottom) {
+            uint32_t numerator = lhs - bottom; // in [1..254*]
+            uint32_t add = (numerator * 102u) / UINT8_MAX;
+            uint32_t tmp = 128u + add;
+            brightness = (tmp <= UINT8_MAX) ? (uint8_t)tmp : UINT8_MAX;
+        }
+
+        is31fl3746a_set_led_color(ring_handles[ring_index], i, brightness, brightness, brightness);
+    }
+
+    is31fl3746a_flush_led_color(ring_handles[ring_index]);
+}
+
+static char *string_pool_alloc_copy(const char *src, size_t len) {
+    if (len + 1 > STRING_POOL_SIZE)
+        return NULL; /* too large single string */
+    /* wrap simple ring */
+    if (string_pool_head + len + 1 > STRING_POOL_SIZE) {
+        string_pool_head = 0;
+    }
+    char *dst = &string_pool[string_pool_head];
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    string_pool_head += len + 1;
+    return dst;
+}
+
+/* Helper store functions */
+static void store_fixedpoint_var(uint8_t index, uint8_t decimals, int16_t value) {
+    if (index >= MAX_VAR_INDEX)
+        return;
+    variable_value_t *v = &var_table[index];
+    v->type = VAR_FIXEDPOINT;
+    v->u.fp.decimals = decimals;
+    v->u.fp.value = value;
+    v->seq++;
+}
+
+static size_t store_shortstring_var(uint8_t index, const char *str) {
+    size_t len = strlen(str);
+    if (index >= MAX_VAR_INDEX)
+        return len;
+    char *copied = string_pool_alloc_copy(str, len);
+    if (!copied) {
+        /* string too long for pool: ignore update */
+        return len;
+    }
+    variable_value_t *v = &var_table[index];
+    v->type = VAR_SHORTSTRING;
+    v->u.str = copied;
+    v->seq++;
+    return len;
+}
+
+static void handle_hardware_control(uint8_t index, uint8_t value) {
+    /* LED rings (0-3), Reset (4), Sleep (5), others reserved */
+    if (index <= 3) {
+        set_led_ring_value(index, value);
+    } else if (index == 4 && value == 1) {
+        ESP_LOGI(TAG, "Resetting due to request from HID variable update");
+        esp_restart();
+    } else if (index == 5) {
+        ESP_LOGW(TAG, "Received unimplemented sleep level update (value %d)", value);
+        /* ignore for now */
+    } else {
+        ESP_LOGW(TAG, "Received hardware control update with unknown index %d (value %d)", index, value);
+        /* ignore for now */
+    }
+}
+
+/* on_usb_hid_screen_spec_fragment_report:
+   - Assumes fragments start at index 0 and arrive in-order.
+   - If a fragment 0 arrives, start/restart assembly.
+   - If any out-of-order fragment arrives, ignore until fragment 0 restarts the sequence.
+*/
+void on_usb_hid_screen_spec_fragment_report(const hid_screen_spec_fragment_out_report_t *report) {
     ESP_LOGI(
-        TAG,
-        "Received HID status report: status_flags=0x%04X, sub_state=%d, main_state=%d, actual_position=%d, "
-        "demand_position=%d, current=%d, warning_flags=0x%04X, error_code=0x%04X",
-        report->status_flags, report->sub_state, report->main_state, report->actual_position, report->demand_position,
-        report->current, report->warning_flags, report->error_code
+        TAG, "Received HID screen spec fragment report: %d/%d for screen ID %d", report->frag_index + 1,
+        report->frag_total, report->screen_id
     );
 
-    xSemaphoreTake(status_mutex, portMAX_DELAY);
-    memcpy(&current_status, report, sizeof(hid_status_input_report_t));
-    has_status = true;
-    xSemaphoreGive(status_mutex);
+    /* Restart on frag 0 */
+    if (report->frag_index == 0) {
+        free(assembling_buffer);
+        assembling_buffer = NULL;
+        assembling_screen_id = report->screen_id;
+        assembling_frag_total = report->frag_total;
+        assembling_next_index = 0;
+        size_t total_size = (size_t)assembling_frag_total * sizeof(report->payload);
+        assembling_buffer = (uint8_t *)calloc(1, total_size);
+        if (!assembling_buffer) {
+            ESP_LOGE(TAG, "OOM allocating screen spec buffer size=%d", (int)total_size);
+            assembling_screen_id = -1;
+            assembling_frag_total = 0;
+            return;
+        }
+    }
+
+    if (assembling_buffer == NULL || report->screen_id != assembling_screen_id) {
+        ESP_LOGW(TAG, "Ignoring fragment %d for screen %d (no active assembly)", report->frag_index, report->screen_id);
+        return;
+    }
+
+    if (report->frag_total != assembling_frag_total) {
+        ESP_LOGW(
+            TAG, "Fragment total %d does not match expected %d — waiting for restart at frag 0", report->frag_total,
+            assembling_frag_total
+        );
+        return;
+    }
+
+    /* Expect fragments in-order */
+    if (report->frag_index != assembling_next_index) {
+        ESP_LOGW(
+            TAG, "Out-of-order fragment %d (expected %d) — waiting for restart at frag 0", report->frag_index,
+            assembling_next_index
+        );
+        return;
+    }
+
+    /* Copy payload into slot */
+    size_t slot_offset = (size_t)report->frag_index * sizeof(report->payload);
+    memcpy(assembling_buffer + slot_offset, report->payload, sizeof(report->payload));
+    assembling_next_index++;
+
+    /* If not complete yet, wait for more fragments */
+    if (assembling_next_index < assembling_frag_total)
+        return;
+
+    /* Complete: take ownership of buffer as current_spec_buffer */
+    size_t total_size = (size_t)assembling_frag_total * sizeof(report->payload);
+    uint8_t *buf = assembling_buffer;
+    assembling_buffer = NULL;
+    assembling_screen_id = -1;
+    assembling_frag_total = 0;
+    assembling_next_index = 0;
+
+    /* Parse in-place; spec points into buf */
+    screen_spec_t *spec = parse_screen_spec_inplace(report->screen_id, buf, total_size);
+
+    /* Replace current parsed screen and buffer (free previous) */
+    free_current_parsed_screen();
+    current_parsed_screen = spec;
+    current_spec_buffer = buf;
+
+    /* 1) Update LVGL under lvgl_mutex */
+    xSemaphoreTake(lvgl_mutex, portMAX_DELAY);
+    display_screen_spec(spec);
+    xSemaphoreGive(lvgl_mutex);
+
+    /* 2) Notify host that we've processed the screen */
+    xSemaphoreTake(input_report_mutex, portMAX_DELAY);
+    current_input_report.active_screen_id = report->screen_id;
+    xSemaphoreGive(input_report_mutex);
+}
+
+void on_usb_hid_variable_update_report(const hid_variable_update_out_report_t *report) {
+    ESP_LOGI(TAG, "Received HID variable update report: count=%d", report->count);
+
+    // TODO: We should really be defensive about bounds checks here...
+
+    uint32_t dirty_mask = 0;
+
+    const uint8_t *entries = report->entries;
+    for (uint8_t i = 0; i < report->count; ++i) {
+        uint8_t tag = *entries++;
+
+        // Compact format tag bits, parse this up-front
+        uint8_t type = (tag & 0x60) >> 5;
+        uint8_t index = tag & 0x1F;
+
+        if (tag & 0x80) {
+            // Extended format, not currently used
+            uint8_t index = *entries++;
+            uint8_t len = *entries++;
+            entries += len;
+            ESP_LOGW(TAG, "Unsupported extended variable update: type=%d index=%d len=%d", tag & 0x7F, index, len);
+        } else if (type == 0) {
+            uint8_t decimals = *entries++;
+            uint16_t value = *entries++;
+            value |= *entries++ << 8;
+            ESP_LOGD(TAG, "Variable update: index=%d type=FixedPoint decimals=%d value=%d", index, decimals, value);
+            store_fixedpoint_var(index, decimals, value);
+            dirty_mask |= (1u << index);
+        } else if (type == 1) {
+            ESP_LOGD(TAG, "Variable update: index=%d type=ShortString value='%s'", index, entries);
+            size_t len = store_shortstring_var(index, (char *)entries);
+            entries += len + 1;
+            dirty_mask |= (1u << index);
+        } else if (type == 2) {
+            ESP_LOGW(TAG, "Received variable update with reserved type 2, index %d", index);
+        } else if (type == 3) {
+            uint8_t value = *entries++;
+            ESP_LOGD(TAG, "Variable update: index=%d type=HardwareControl value=%d", index, value);
+            handle_hardware_control(index, value);
+        }
+    }
+
+    if (dirty_mask) {
+        xSemaphoreTake(lvgl_mutex, portMAX_DELAY);
+        update_bound_labels(dirty_mask);
+        xSemaphoreGive(lvgl_mutex);
+    }
+}
+
+void on_encoder_event(lv_event_t *event) {
+    uint8_t index = (uint8_t)(intptr_t)lv_event_get_user_data(event);
+    if (index >= ENCODER_COUNT) {
+        ESP_LOGW(TAG, "Received encoder event with invalid index %d", index);
+        return;
+    }
+
+    uint32_t event_code = lv_event_get_code(event);
+
+    xSemaphoreTake(input_report_mutex, portMAX_DELAY);
+
+    while (current_input_report.event_count >= (MAX_EVENT_COUNT - 1)) {
+        ESP_LOGW(TAG, "Input report event buffer full, overwriting last event");
+        current_input_report.event_count -= 1;
+    }
+
+    switch (event_code) {
+    case LV_EVENT_SINGLE_CLICKED:
+        ESP_LOGD(TAG, "Encoder %d single clicked", index);
+        current_input_report.events[current_input_report.event_count].event_type = 0x00;
+        current_input_report.events[current_input_report.event_count].event_data = index;
+        current_input_report.event_count += 1;
+        break;
+    case LV_EVENT_DOUBLE_CLICKED:
+        ESP_LOGD(TAG, "Encoder %d double clicked", index);
+        current_input_report.events[current_input_report.event_count].event_type = 0x01;
+        current_input_report.events[current_input_report.event_count].event_data = index;
+        current_input_report.event_count += 1;
+        break;
+    case LV_EVENT_LONG_PRESSED:
+        ESP_LOGD(TAG, "Encoder %d long press started", index);
+        encoder_long_press_active[index] = true;
+        current_input_report.events[current_input_report.event_count].event_type = 0x02;
+        current_input_report.events[current_input_report.event_count].event_data = index;
+        current_input_report.event_count += 1;
+        break;
+    case LV_EVENT_RELEASED:
+        if (encoder_long_press_active[index]) {
+            ESP_LOGD(TAG, "Encoder %d long press ended", index);
+            current_input_report.events[current_input_report.event_count].event_type = 0x03;
+            current_input_report.events[current_input_report.event_count].event_data = index;
+            current_input_report.event_count += 1;
+            encoder_long_press_active[index] = false;
+        }
+        break;
+    case LV_EVENT_ROTARY:
+        int32_t rotation = lv_event_get_rotary_diff(event);
+        ESP_LOGD(TAG, "Encoder %d rotated by %d", index, rotation);
+        current_input_report.encoder_deltas[index] += (int8_t)rotation;
+        break;
+    default:
+        ESP_LOGW(TAG, "Received unhandled encoder event code %d for encoder %d", event_code, index);
+        break;
+    }
+
+    xSemaphoreGive(input_report_mutex);
 }
 
 void state_task_main(void *pvParameters) {
-    status_mutex = xSemaphoreCreateMutex();
-    controls_mutex = xSemaphoreCreateMutex();
+    input_report_mutex = xSemaphoreCreateMutex();
 
     xSemaphoreTake(lvgl_mutex, portMAX_DELAY);
     display_splash_screens();
@@ -476,13 +881,9 @@ void state_task_main(void *pvParameters) {
 
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    for (int i = 0; i < 10 && (!has_limits || !has_status); i++) {
-        // TODO: If this takes too long, display something on screen
-        ESP_LOGI(TAG, "Waiting for HID reports...");
-
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
+    // Set up the LEDs
+    // Encoders get set to 100% brightness red
+    // LED rings get set to lowest global brightness, and then per-LED scaling to force relative 50% brightness red
     for (int i = 0; i < ENCODER_COUNT; ++i) {
         i2c_encoder_set_led_color(encoder_handles[i], 255, 0, 0);
 
@@ -495,24 +896,16 @@ void state_task_main(void *pvParameters) {
         is31fl3746a_flush_led_scale(ring_handles[i]);
     }
 
-    // TODO: These are our default limits, use them if we're not connected
-    //       This makes development a little easier
-    if (!has_limits) {
-        hid_options_feature_report_t default_limits = {
-            .stroke_limit = 3600000,
-            .velocity_limit = 1750000,
-            .acceleration_limit = 999000,
-        };
-
-        on_usb_hid_options_report(&default_limits);
+    // Setup event handlers to populate the input report
+    // TODO: The spec says some of these should be suppressed while displaying a menu
+    for (uint8_t i = 0; i < ENCODER_COUNT; ++i) {
+        void *user_data = (void *)(intptr_t)i;
+        lv_indev_add_event_cb(encoder_indevs[i], on_encoder_event, LV_EVENT_SINGLE_CLICKED, user_data);
+        lv_indev_add_event_cb(encoder_indevs[i], on_encoder_event, LV_EVENT_DOUBLE_CLICKED, user_data);
+        lv_indev_add_event_cb(encoder_indevs[i], on_encoder_event, LV_EVENT_LONG_PRESSED, user_data);
+        lv_indev_add_event_cb(encoder_indevs[i], on_encoder_event, LV_EVENT_RELEASED, user_data);
+        lv_indev_add_event_cb(encoder_indevs[i], on_encoder_event, LV_EVENT_ROTARY, user_data);
     }
-
-    xSemaphoreTake(lvgl_mutex, portMAX_DELAY);
-    display_main_screens();
-    xSemaphoreGive(lvgl_mutex);
-
-    // TODO: Better way to wait for animation to complete - perhaps the LV_EVENT_SCREEN_LOADED event?
-    vTaskDelay(pdMS_TO_TICKS(500));
 
     TickType_t last_wake_time = xTaskGetTickCount();
 
@@ -522,9 +915,14 @@ void state_task_main(void *pvParameters) {
             continue;
         }
 
-        xSemaphoreTake(controls_mutex, portMAX_DELAY);
-        send_usb_hid_control_report(&current_controls);
-        xSemaphoreGive(controls_mutex);
+        xSemaphoreTake(input_report_mutex, portMAX_DELAY);
+        send_usb_hid_input_report(&current_input_report);
+        current_input_report.encoder_deltas[0] = 0;
+        current_input_report.encoder_deltas[1] = 0;
+        current_input_report.encoder_deltas[2] = 0;
+        current_input_report.encoder_deltas[3] = 0;
+        current_input_report.event_count = 0;
+        xSemaphoreGive(input_report_mutex);
 
         // TODO: Get the polling interval from the USB HID subsystem (and make it configurable)
         xTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(10));

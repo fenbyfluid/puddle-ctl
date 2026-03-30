@@ -9,56 +9,75 @@ extern "C" {
 #endif
 
 // Our custom report data structures
+// All reports are padded to 63 bytes (CFG_TUD_HID_EP_BUFSIZE - 1)
+// This seems to only strictly be necessary for IN reports, but apply it everywhere
+
+// DeviceInfo (Device -> Host, Feature Report 1 via GET_REPORT)
+typedef struct {
+    uint8_t firmware_version_major;
+    uint8_t firmware_version_minor;
+    uint8_t features;
+    uint8_t padding[60];
+} __attribute__((packed)) hid_device_info_feature_report_t;
+
+_Static_assert(
+    sizeof(hid_device_info_feature_report_t) == (CFG_TUD_HID_EP_BUFSIZE - 1),
+    "HID device info feature report wrong size"
+);
+
+// ScreenSpec (Host -> Device, OUT Report 1)
+typedef struct {
+    uint8_t screen_id;
+    uint8_t frag_total;
+    uint8_t frag_index;
+    uint8_t payload[60];
+} __attribute__((packed)) hid_screen_spec_fragment_out_report_t;
+
+_Static_assert(
+    sizeof(hid_screen_spec_fragment_out_report_t) == (CFG_TUD_HID_EP_BUFSIZE - 1),
+    "HID screen spec fragment out report wrong size"
+);
+
+// VariableUpdate (Host -> Device, OUT Report 2)
+typedef struct {
+    uint8_t count;
+    uint8_t entries[62];
+} __attribute__((packed)) hid_variable_update_out_report_t;
+
+_Static_assert(
+    sizeof(hid_variable_update_out_report_t) == (CFG_TUD_HID_EP_BUFSIZE - 1),
+    "HID variable update out report wrong size"
+);
 
 typedef struct {
-    int32_t stroke_limit;
-    int32_t velocity_limit;
-    int32_t acceleration_limit;
-} __attribute__((packed)) hid_options_feature_report_t;
+    uint8_t event_type;
+    uint8_t event_data;
+} __attribute__((packed)) hid_input_report_event_t;
 
+// InputReport (Device -> Host, IN Report 1)
 typedef struct {
-    uint16_t status_flags;
-    uint8_t sub_state;
-    uint8_t main_state;
-    int32_t actual_position;
-    int32_t demand_position;
-    int16_t current;
-    uint16_t warning_flags;
-    uint16_t error_code;
-} __attribute__((packed)) hid_status_input_report_t;
+    uint8_t active_screen_id;
+    int8_t encoder_deltas[4];
+    uint8_t event_count;
+    hid_input_report_event_t events[28];
+    uint8_t padding[1];
+} __attribute__((packed)) hid_input_report_t;
 
-typedef struct {
-    uint8_t enabled : 1;
-    uint8_t stopped : 1;
-    uint8_t reserved : 6;
-    int32_t start_position;
-    int32_t end_position;
-    int32_t direction_change_tolerance;
-    int32_t forwards_velocity;
-    int32_t forwards_acceleration;
-    int32_t forwards_deceleration;
-    int32_t backwards_velocity;
-    int32_t backwards_acceleration;
-    int32_t backwards_deceleration;
-    // Padding to make report size 63 bytes, without this, reports don't arrive at our host program
-    uint8_t padding[26];
-} __attribute__((packed)) hid_control_output_report_t;
-
-_Static_assert(sizeof(hid_options_feature_report_t) <= 63, "HID options feature report too large");
-_Static_assert(sizeof(hid_status_input_report_t) <= 63, "HID status input report too large");
-_Static_assert(sizeof(hid_control_output_report_t) == 63, "HID control output report wrong size");
+_Static_assert(sizeof(hid_input_report_t) == (CFG_TUD_HID_EP_BUFSIZE - 1), "HID input report wrong size");
 
 // Application callbacks
 
-void on_usb_hid_options_report(const hid_options_feature_report_t *report);
+void on_usb_hid_screen_spec_fragment_report(const hid_screen_spec_fragment_out_report_t *report);
 
-void on_usb_hid_status_report(const hid_status_input_report_t *report);
+void on_usb_hid_variable_update_report(const hid_variable_update_out_report_t *report);
 
 // Function prototypes
 
 void usb_task_main(void *pvParameters);
 
-void send_usb_hid_control_report(const hid_control_output_report_t *report);
+void set_usb_hid_device_info(uint8_t firmware_version_major, uint8_t firmware_version_minor, uint8_t features);
+
+void send_usb_hid_input_report(const hid_input_report_t *report);
 
 #ifdef __cplusplus
 }

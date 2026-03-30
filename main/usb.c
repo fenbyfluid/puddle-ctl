@@ -12,7 +12,8 @@
 static const char *TAG = "USB";
 
 // Cached HID report data
-static hid_control_output_report_t last_control_report = {0};
+static hid_device_info_feature_report_t device_info_report = {0};
+static hid_input_report_t last_input_report = {0};
 
 // Placeholder, will be replaced with chip ID
 char serial_number[32] = CONFIG_TINYUSB_DESC_SERIAL_STRING;
@@ -36,10 +37,11 @@ const char *descriptor_strings[] = {
     CONFIG_TINYUSB_DESC_PRODUCT_STRING,      // 4: HID Interface
     CONFIG_TINYUSB_DESC_CDC_STRING,          // 5: CDC Interface
     CONFIG_TINYUSB_DESC_PRODUCT_STRING,      // 6: DFU Runtime Interface
-    NULL, // NULL: Must be last. Indicates end of array
+    NULL,                                    // NULL: Must be last. Indicates end of array
 };
 
-#define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + (1 * TUD_HID_INOUT_DESC_LEN) + (1 * TUD_CDC_DESC_LEN) + (1 * TUD_DFU_RT_DESC_LEN))
+#define TUSB_DESC_TOTAL_LEN                                                                                            \
+    (TUD_CONFIG_DESC_LEN + (1 * TUD_HID_INOUT_DESC_LEN) + (1 * TUD_CDC_DESC_LEN) + (1 * TUD_DFU_RT_DESC_LEN))
 
 enum {
     ITF_NUM_HID = 0,
@@ -51,20 +53,27 @@ enum {
 
 const uint8_t hid_report_descriptor[] = {
     TUD_HID_REPORT_DESC_GENERIC_INOUT(CFG_TUD_HID_EP_BUFSIZE - 1, HID_REPORT_ID(1)),
+    TUD_HID_REPORT_DESC_GENERIC_INOUT(CFG_TUD_HID_EP_BUFSIZE - 1, HID_REPORT_ID(2)),
 };
 
 static const uint8_t configuration_descriptor[] = {
     // Configuration number, interface count, string index, total length, attribute, power in mA
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, STRID_LANGID, TUSB_DESC_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 500),
 
-    // Interface number, string index, boot protocol, report descriptor len, EP data address (out, in), size, and polling interval
-    TUD_HID_INOUT_DESCRIPTOR(ITF_NUM_HID, STRID_HID_INTERFACE, false, sizeof(hid_report_descriptor), 0x01, 0x81, CFG_TUD_HID_EP_BUFSIZE, 10),
+    // Interface number, string index, boot protocol, report descriptor len, EP data address (out, in), size, and
+    // polling interval
+    TUD_HID_INOUT_DESCRIPTOR(
+        ITF_NUM_HID, STRID_HID_INTERFACE, false, sizeof(hid_report_descriptor), 0x01, 0x81, CFG_TUD_HID_EP_BUFSIZE, 10
+    ),
 
     // Interface number, string index, EP notification address and size, EP data address (out, in), and size.
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, STRID_CDC_INTERFACE, 0x82, 8, 0x03, 0x83, CFG_TUD_ENDPOINT0_SIZE),
 
     // Interface number, string index, attributes, detach timeout, transfer size
-    TUD_DFU_RT_DESCRIPTOR(ITF_NUM_DFU_RT, STRID_DFU_RT_INTERFACE, DFU_ATTR_CAN_DOWNLOAD | DFU_ATTR_MANIFESTATION_TOLERANT| DFU_ATTR_WILL_DETACH, 1000, CFG_TUD_ENDPOINT0_SIZE),
+    TUD_DFU_RT_DESCRIPTOR(
+        ITF_NUM_DFU_RT, STRID_DFU_RT_INTERFACE,
+        DFU_ATTR_CAN_DOWNLOAD | DFU_ATTR_MANIFESTATION_TOLERANT | DFU_ATTR_WILL_DETACH, 1000, CFG_TUD_ENDPOINT0_SIZE
+    ),
 };
 
 // Mandatory HID callbacks follow
@@ -80,18 +89,33 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
 // Invoked when received GET_REPORT control request
 // Application must fill buffer report's content and return its length.
 // Return zero will cause the stack to STALL request
-uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t *buffer, uint16_t reqlen) {
+uint16_t tud_hid_get_report_cb(
+    uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t *buffer, uint16_t reqlen
+) {
     ESP_LOGD(TAG, "tud_hid_get_report_cb(%d, %d, %d, %p, %d)", instance, report_id, report_type, buffer, reqlen);
 
-    if (report_id == 1 && report_type == HID_REPORT_TYPE_INPUT) {
-        size_t copy_len = sizeof(last_control_report) - sizeof(last_control_report.padding);
+    if (report_type == HID_REPORT_TYPE_FEATURE && report_id == 1) {
+        size_t copy_len = sizeof(device_info_report) - sizeof(device_info_report.padding);
         if (reqlen < copy_len) {
             copy_len = reqlen;
         }
 
-        memcpy(buffer, &last_control_report, copy_len);
+        memcpy(buffer, &device_info_report, copy_len);
 
-        ESP_LOGD(TAG, "Returning last control report (%d bytes)", copy_len);
+        ESP_LOGD(TAG, "Returning device info feature report (%d bytes)", copy_len);
+
+        return copy_len;
+    }
+
+    if (report_type == HID_REPORT_TYPE_INPUT && report_id == 1) {
+        size_t copy_len = sizeof(last_input_report) - sizeof(last_input_report.padding);
+        if (reqlen < copy_len) {
+            copy_len = reqlen;
+        }
+
+        memcpy(buffer, &last_input_report, copy_len);
+
+        ESP_LOGD(TAG, "Returning last input report (%d bytes)", copy_len);
 
         return copy_len;
     }
@@ -105,54 +129,49 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_t
 // received data on OUT endpoint ( Report ID = 0, Type = 0 )
 //
 // When confused why the first byte is missing: https://github.com/hathach/tinyusb/issues/2929
-void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize) {
-    ESP_LOGD(TAG, "tud_hid_set_report_cb(%d, %d, %d, %p, %d)", instance, report_id, report_type, buffer, bufsize);
+void tud_hid_set_report_cb(
+    uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize
+) {
+    // ESP_LOGD(TAG, "tud_hid_set_report_cb(%d, %d, %d, %p, %d)", instance, report_id, report_type, buffer, bufsize);
 
-    ESP_LOG_BUFFER_HEX_LEVEL(TAG, buffer, bufsize, ESP_LOG_DEBUG);
-
-    if (report_id == 1 && report_type == HID_REPORT_TYPE_FEATURE) {
-        if (bufsize < sizeof(hid_options_feature_report_t)) {
-            ESP_LOGW(
-                TAG, "SET_REPORT feature report too small (%d bytes), expected %d bytes",
-                bufsize, sizeof(hid_options_feature_report_t)
-            );
-            return;
-        }
-
-        const hid_options_feature_report_t *report = (const hid_options_feature_report_t *)buffer;
-        on_usb_hid_options_report(report);
-
-        return;
-    }
+    // ESP_LOG_BUFFER_HEX_LEVEL(TAG, buffer, bufsize, ESP_LOG_DEBUG);
 
     // Work around https://github.com/hathach/tinyusb/issues/2929 hidd_xfer_cb behaviour
-    if (report_id == 0 && report_type == HID_REPORT_TYPE_OUTPUT && bufsize > 0 && buffer[0] == 1) {
-        report_id = 1;
+    // We only use numbered reports, so do this unconditionally
+    if (report_id == 0 && report_type == HID_REPORT_TYPE_OUTPUT && bufsize > 0) {
+        report_id = buffer[0];
         buffer++;
         bufsize--;
     }
 
-    if (report_id == 1 && report_type == HID_REPORT_TYPE_OUTPUT) {
-        if (bufsize > 0 && buffer[0] == 0) {
-            on_usb_hid_status_report(NULL);
-            return;
-        }
-
-        if (bufsize < (1 + sizeof(hid_status_input_report_t))) {
+    if (report_type == HID_REPORT_TYPE_OUTPUT && report_id == 1) {
+        if (bufsize < sizeof(hid_screen_spec_fragment_out_report_t)) {
             ESP_LOGW(
-                TAG, "SET_REPORT output report too small (%d bytes), expected %d bytes",
-                bufsize, 1 + sizeof(hid_status_input_report_t)
+                TAG, "SET_REPORT ScreenSpec fragment OUT report too small (%d bytes), expected %d bytes", bufsize,
+                sizeof(hid_screen_spec_fragment_out_report_t)
             );
+
             return;
         }
 
-        if (buffer[0] != 1) {
-            ESP_LOGW(TAG, "SET_REPORT output report has unexpected status byte %d, expected 1", buffer[0]);
+        const hid_screen_spec_fragment_out_report_t *report = (const hid_screen_spec_fragment_out_report_t *)buffer;
+        on_usb_hid_screen_spec_fragment_report(report);
+
+        return;
+    }
+
+    if (report_type == HID_REPORT_TYPE_OUTPUT && report_id == 2) {
+        if (bufsize < sizeof(hid_variable_update_out_report_t)) {
+            ESP_LOGW(
+                TAG, "SET_REPORT VariableUpdate OUT report too small (%d bytes), expected %d bytes", bufsize,
+                sizeof(hid_variable_update_out_report_t)
+            );
+
             return;
         }
 
-        const hid_status_input_report_t *report = (const hid_status_input_report_t *)&buffer[1];
-        on_usb_hid_status_report(report);
+        const hid_variable_update_out_report_t *report = (const hid_variable_update_out_report_t *)buffer;
+        on_usb_hid_variable_update_report(report);
 
         return;
     }
@@ -176,7 +195,9 @@ void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_
 }
 
 // Invoked when a transfer wasn't successful
-void tud_hid_report_failed_cb(uint8_t instance, hid_report_type_t report_type, uint8_t const* report, uint16_t xferred_bytes) {
+void tud_hid_report_failed_cb(
+    uint8_t instance, hid_report_type_t report_type, uint8_t const *report, uint16_t xferred_bytes
+) {
     ESP_LOGD(TAG, "tud_hid_report_failed_cb(%d, %d, %p, %d)", instance, report_type, report, xferred_bytes);
 
     ESP_LOG_BUFFER_HEX_LEVEL(TAG, report, xferred_bytes, ESP_LOG_DEBUG);
@@ -189,10 +210,10 @@ void tud_hid_report_failed_cb(uint8_t instance, hid_report_type_t report_type, u
 
 // Mandatory DFU callbacks follow
 
-#include "soc/rtc_cntl_reg.h"
+#include "esp32s3/rom/usb/chip_usb_dw_wrapper.h"
 #include "esp32s3/rom/usb/usb_dc.h"
 #include "esp32s3/rom/usb/usb_persist.h"
-#include "esp32s3/rom/usb/chip_usb_dw_wrapper.h"
+#include "soc/rtc_cntl_reg.h"
 
 // Invoked when a DFU_DETACH request is received and bitWillDetach is set
 void tud_dfu_runtime_reboot_to_dfu_cb(void) {
@@ -210,23 +231,27 @@ void tud_dfu_runtime_reboot_to_dfu_cb(void) {
 
 // End of the esp_tinyusb callbacks
 
-static void device_event_handler(tinyusb_event_t *event, void *arg){
-    ESP_LOGD(TAG, "USB event: %d", event->id);
-}
+static void device_event_handler(tinyusb_event_t *event, void *arg) { ESP_LOGD(TAG, "USB event: %d", event->id); }
 
 // Our APIs
 
-void send_usb_hid_control_report(const hid_control_output_report_t *report) {
+void set_usb_hid_device_info(uint8_t firmware_version_major, uint8_t firmware_version_minor, uint8_t features) {
+    device_info_report.firmware_version_major = firmware_version_major;
+    device_info_report.firmware_version_minor = firmware_version_minor;
+    device_info_report.features = features;
+}
+
+void send_usb_hid_input_report(const hid_input_report_t *report) {
     if (!tud_hid_ready()) {
-        ESP_LOGW(TAG, "USB HID not ready, cannot send control report");
+        ESP_LOGW(TAG, "USB HID not ready, cannot send input report");
         return;
     }
 
     // Cache the last report we sent for GET_REPORT requests
-    memcpy(&last_control_report, report, sizeof(last_control_report) - sizeof(last_control_report.padding));
+    memcpy(&last_input_report, report, sizeof(last_input_report) - sizeof(last_input_report.padding));
 
     if (!tud_hid_report(1, report, sizeof(*report))) {
-        ESP_LOGW(TAG, "Failed to send HID control report");
+        ESP_LOGW(TAG, "Failed to send HID input report");
     }
 }
 
@@ -236,9 +261,8 @@ void usb_task_main(void *pvParameters) {
     uint8_t mac[6];
     ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY));
     snprintf(
-        serial_number, sizeof(serial_number),
-        "%02x:%02x:%02x:%02x:%02x:%02x",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        serial_number, sizeof(serial_number), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4],
+        mac[5]
     );
 
     ESP_LOGD(TAG, "Got MAC address: %s", serial_number);
@@ -251,7 +275,8 @@ void usb_task_main(void *pvParameters) {
 #endif // TUD_OPT_HIGH_SPEED
 
     tusb_cfg.descriptor.string = descriptor_strings;
-    while (tusb_cfg.descriptor.string[++tusb_cfg.descriptor.string_count] != NULL);
+    while (tusb_cfg.descriptor.string[++tusb_cfg.descriptor.string_count] != NULL)
+        ;
 
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
 
