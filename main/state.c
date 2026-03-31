@@ -85,6 +85,8 @@ typedef struct {
     uint32_t var_mask; /* bit i set if template references variable i */
     size_t buf_size;   /* render buffer size */
     char *buf;         /* allocated render buffer */
+    int8_t encoder_index; /* -1 if not tied to an encoder */
+    int8_t encoder_y_offset; /* y-offset used when aligning encoder labels */
 } label_binding_t;
 
 static label_binding_t *label_bindings = NULL;
@@ -161,7 +163,8 @@ static void clear_label_bindings(void) {
 }
 
 /* Register a label for future variable-driven updates. If tmpl contains no variables, registration is skipped. */
-static void register_label_binding(lv_obj_t *label, const char *tmpl, size_t buf_size) {
+/* encoder_index: -1 for non-encoder labels; encoder_y_offset ignored when -1 */
+static void register_label_binding(lv_obj_t *label, const char *tmpl, size_t buf_size, int8_t encoder_index, int8_t encoder_y_offset) {
     if (!tmpl || tmpl[0] == '\0' || !label)
         return;
 
@@ -201,6 +204,8 @@ static void register_label_binding(lv_obj_t *label, const char *tmpl, size_t buf
     label_bindings[label_binding_count].var_mask = mask;
     label_bindings[label_binding_count].buf_size = buf_size;
     label_bindings[label_binding_count].buf = malloc(buf_size);
+    label_bindings[label_binding_count].encoder_index = encoder_index;
+    label_bindings[label_binding_count].encoder_y_offset = encoder_y_offset;
     if (label_bindings[label_binding_count].buf)
         label_bindings[label_binding_count].buf[0] = '\0';
     label_binding_count++;
@@ -492,6 +497,12 @@ static void update_bound_labels(uint32_t dirty_mask) {
             continue;
         render_template_to_buf(b->tmpl, b->buf, b->buf_size);
         lv_label_set_text(b->label, b->buf);
+        /* If this label is tied to an encoder, re-run the encoder alignment
+           so position updates to reflect the new text width. */
+        if (b->encoder_index >= 0) {
+            lv_obj_update_layout(b->label);
+            align_encoder_center(b->label, b->encoder_y_offset, (uint8_t)b->encoder_index);
+        }
     }
 }
 
@@ -511,7 +522,7 @@ static void display_screen_spec_side(const screen_spec_t *spec, bool right_side)
         char tmp[64];
         render_template_to_buf(tmpl, tmp, sizeof(tmp));
         lv_label_set_text(rot_label, tmp);
-        register_label_binding(rot_label, tmpl, sizeof(tmp));
+        register_label_binding(rot_label, tmpl, sizeof(tmp), (int8_t)enc, 0);
         align_encoder_center(rot_label, 0, enc);
 
         lv_obj_t *btn_label = lv_label_create(screen);
@@ -519,7 +530,7 @@ static void display_screen_spec_side(const screen_spec_t *spec, bool right_side)
         char tmp2[64];
         render_template_to_buf(tmpl2, tmp2, sizeof(tmp2));
         lv_label_set_text(btn_label, tmp2);
-        register_label_binding(btn_label, tmpl2, sizeof(tmp2));
+        register_label_binding(btn_label, tmpl2, sizeof(tmp2), (int8_t)enc, -10);
         align_encoder_center(btn_label, -10, enc);
     }
 
@@ -544,7 +555,7 @@ static void display_screen_spec_side(const screen_spec_t *spec, bool right_side)
             char linebuf[128];
             render_template_to_buf(text_lines[i], linebuf, sizeof(linebuf));
             lv_label_set_text(line, linebuf);
-            register_label_binding(line, text_lines[i], sizeof(linebuf));
+            register_label_binding(line, text_lines[i], sizeof(linebuf), -1, 0);
 
             lv_obj_align(line, LV_ALIGN_TOP_MID, 0, i * 11);
         }
@@ -555,7 +566,7 @@ static void display_screen_spec_side(const screen_spec_t *spec, bool right_side)
             char linebuf[128];
             render_template_to_buf(menu_title, linebuf, sizeof(linebuf));
             lv_label_set_text(title, linebuf);
-            register_label_binding(title, menu_title, sizeof(linebuf));
+            register_label_binding(title, menu_title, sizeof(linebuf), -1, 0);
 
             lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
         }
@@ -570,7 +581,7 @@ static void display_screen_spec_side(const screen_spec_t *spec, bool right_side)
             char linebuf[128];
             render_template_to_buf(menu_items[i].label, linebuf, sizeof(linebuf));
             lv_label_set_text(item, linebuf);
-            register_label_binding(item, menu_items[i].label, sizeof(linebuf));
+            register_label_binding(item, menu_items[i].label, sizeof(linebuf), -1, 0);
 
             lv_obj_align(item, LV_ALIGN_TOP_MID, 0, (11 + 4) + i * 11);
         }
@@ -651,12 +662,23 @@ static size_t store_shortstring_var(uint8_t index, const char *str) {
     size_t len = strlen(str);
     if (index >= MAX_VAR_INDEX)
         return len;
+        
+    /* Special-case empty string to avoid consuming pool space */
+    variable_value_t *v = &var_table[index];
+    if (len == 0) {
+        static const char empty_string[] = "";
+        v->type = VAR_SHORTSTRING;
+        v->u.str = (char *)empty_string;
+        v->seq++;
+        return len;
+    }
+
     char *copied = string_pool_alloc_copy(str, len);
     if (!copied) {
         /* string too long for pool: ignore update */
         return len;
     }
-    variable_value_t *v = &var_table[index];
+
     v->type = VAR_SHORTSTRING;
     v->u.str = copied;
     v->seq++;
