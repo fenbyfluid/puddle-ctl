@@ -612,6 +612,11 @@ void set_led_ring_value(uint8_t ring_index, uint8_t value) {
         return;
     }
 
+    if (!ring_handles[ring_index]) {
+        ESP_LOGW(TAG, "Ignoring attempt to set LED ring value for ring index %d (hardware fault)", ring_index);
+        return;
+    }
+
     for (int i = 0; i < IS31FL3746A_LED_COUNT; ++i) {
         uint32_t lhs = (uint32_t)value * (uint32_t)IS31FL3746A_LED_COUNT;
         uint32_t top = UINT8_MAX * (uint32_t)(i + 1);
@@ -908,6 +913,11 @@ void state_task_main(void *pvParameters) {
     // LED rings get set to lowest global brightness, and then per-LED scaling to force relative 50% brightness red
     for (int i = 0; i < ENCODER_COUNT; ++i) {
         i2c_encoder_set_led_color(encoder_handles[i], 255, 0, 0);
+
+        if (!ring_handles[i]) {
+            ESP_LOGW(TAG, "Skipping LED ring setup for ring index %d (hardware fault)", i);
+            continue;
+        }
 
         is31fl3746a_set_global_scale(ring_handles[i], 0x01);
 

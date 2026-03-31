@@ -217,6 +217,13 @@ void init_i2c_bus(void) {
     }
 
     for (int i = 0; i < ENCODER_COUNT; ++i) {
+        // TODO: We've run into an issue where LED ring 0 (the last one in the chain) appears to be faulty, so probe first
+        if (i2c_master_probe(bus_handle, 0x64 + i, 100) != ESP_OK) {
+            ESP_LOGW(TAG, "LED ring %d not found at address 0x%02X, skipping", i, 0x64 + i);
+            ring_handles[i] = NULL;
+            continue;
+        }
+
         ESP_ERROR_CHECK(is31fl3746a_create(bus_handle, 0x64 + i, I2C_CLOCK_SPEED, &ring_handles[i]));
         ESP_ERROR_CHECK(is31fl3746a_init(ring_handles[i]));
     }
@@ -361,6 +368,11 @@ void app_main(void) {
     esp_reset_reason_t reset_reason = esp_reset_reason();
     ESP_LOGI(TAG, "Reset reason: %d", reset_reason);
 
+    if (reset_reason == ESP_RST_PANIC) {
+        ESP_LOGW(TAG, "Last reset was due to a panic, waiting 30 seconds");
+        vTaskDelay(pdMS_TO_TICKS(30000));
+    }
+
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
 
     lv_init();
@@ -388,6 +400,11 @@ void app_main(void) {
     }
 
     ESP_LOGI(TAG, "Hardware initialization complete");
+
+    // while (true) {
+    //     ESP_LOGI(TAG, "-- debug wait --");
+    //     vTaskDelay(pdMS_TO_TICKS(5000));
+    // }
 
     set_usb_hid_device_info((CONFIG_TINYUSB_DESC_BCD_DEVICE >> 8) & 0xFF, CONFIG_TINYUSB_DESC_BCD_DEVICE & 0xFF, 0x00);
 
