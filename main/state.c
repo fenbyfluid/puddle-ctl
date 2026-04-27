@@ -36,6 +36,7 @@ typedef struct {
 
 typedef struct {
     uint8_t screen_id;
+
     /* encoder labels (pointers into spec buffer) */
     char *encoder_primary[ENCODER_COUNT];
     char *encoder_secondary[ENCODER_COUNT];
@@ -49,6 +50,10 @@ typedef struct {
     uint8_t left_menu_item_count;
     menu_item_ptr_t left_menu_items[MAX_MENU_ITEMS];
 
+    lv_screen_load_anim_t left_anim_type;
+    uint32_t left_anim_time;
+    uint32_t left_anim_delay;
+
     /* right main area */
     uint8_t right_top_margin;
     uint8_t right_type;
@@ -57,6 +62,10 @@ typedef struct {
     char *right_menu_title;
     uint8_t right_menu_item_count;
     menu_item_ptr_t right_menu_items[MAX_MENU_ITEMS];
+
+    lv_screen_load_anim_t right_anim_type;
+    uint32_t right_anim_time;
+    uint32_t right_anim_delay;
 } screen_spec_t;
 
 static char string_pool[STRING_POOL_SIZE];
@@ -81,11 +90,11 @@ static variable_value_t var_table[MAX_VAR_INDEX];
 // Label binding registry: map LVGL labels to their template and referenced var mask
 typedef struct {
     lv_obj_t *label;
-    const char *tmpl;  /* pointer into current_spec_buffer */
-    uint32_t var_mask; /* bit i set if template references variable i */
-    size_t buf_size;   /* render buffer size */
-    char *buf;         /* allocated render buffer */
-    int8_t encoder_index; /* -1 if not tied to an encoder */
+    const char *tmpl;        /* pointer into current_spec_buffer */
+    uint32_t var_mask;       /* bit i set if template references variable i */
+    size_t buf_size;         /* render buffer size */
+    char *buf;               /* allocated render buffer */
+    int8_t encoder_index;    /* -1 if not tied to an encoder */
     int8_t encoder_y_offset; /* y-offset used when aligning encoder labels */
 } label_binding_t;
 
@@ -164,7 +173,9 @@ static void clear_label_bindings(void) {
 
 /* Register a label for future variable-driven updates. If tmpl contains no variables, registration is skipped. */
 /* encoder_index: -1 for non-encoder labels; encoder_y_offset ignored when -1 */
-static void register_label_binding(lv_obj_t *label, const char *tmpl, size_t buf_size, int8_t encoder_index, int8_t encoder_y_offset) {
+static void register_label_binding(
+    lv_obj_t *label, const char *tmpl, size_t buf_size, int8_t encoder_index, int8_t encoder_y_offset
+) {
     if (!tmpl || tmpl[0] == '\0' || !label)
         return;
 
@@ -345,10 +356,34 @@ static screen_spec_t *parse_screen_spec_inplace(uint8_t screen_id, uint8_t *buf,
         &spec->left_menu_title, &spec->left_menu_item_count, spec->left_menu_items
     );
 
+    if (p + 5 < end) {
+        spec->left_anim_type = (lv_screen_load_anim_t)*p++;
+        spec->left_anim_time = ((uint32_t)*p++);
+        spec->left_anim_time |= ((uint32_t)*p++) << 8;
+        spec->left_anim_delay = ((uint32_t)*p++);
+        spec->left_anim_delay |= ((uint32_t)*p++) << 8;
+    } else {
+        spec->left_anim_type = LV_SCREEN_LOAD_ANIM_NONE;
+        spec->left_anim_time = 0;
+        spec->left_anim_delay = 0;
+    }
+
     parse_main_area_inplace(
         &p, end, &spec->right_type, &spec->right_top_margin, &spec->right_line_count, spec->right_lines,
         &spec->right_menu_title, &spec->right_menu_item_count, spec->right_menu_items
     );
+
+    if (p + 5 < end) {
+        spec->right_anim_type = (lv_screen_load_anim_t)*p++;
+        spec->right_anim_time = ((uint32_t)*p++);
+        spec->right_anim_time |= ((uint32_t)*p++) << 8;
+        spec->right_anim_delay = ((uint32_t)*p++);
+        spec->right_anim_delay |= ((uint32_t)*p++) << 8;
+    } else {
+        spec->right_anim_type = LV_SCREEN_LOAD_ANIM_NONE;
+        spec->right_anim_time = 0;
+        spec->right_anim_delay = 0;
+    }
 
     return spec;
 }
@@ -382,6 +417,9 @@ static void log_screen_spec(const screen_spec_t *spec) {
             );
         }
     }
+    ESP_LOGD(
+        TAG, "  Left anim type=%d, time=%d, delay=%d", spec->left_anim_type, spec->left_anim_time, spec->left_anim_delay
+    );
 
     ESP_LOGD(TAG, "  Right type=%d", spec->right_type);
     ESP_LOGD(TAG, "    Right top_margin=%d", spec->right_top_margin);
@@ -398,6 +436,10 @@ static void log_screen_spec(const screen_spec_t *spec) {
             );
         }
     }
+    ESP_LOGD(
+        TAG, "  Right anim type=%d, time=%d, delay=%d", spec->right_anim_type, spec->right_anim_time,
+        spec->right_anim_delay
+    );
 }
 
 /* Render a template string with {N} placeholders into buf.
@@ -590,7 +632,11 @@ static void display_screen_spec_side(const screen_spec_t *spec, bool right_side)
     uint8_t top_margin = right_side ? spec->right_top_margin : spec->left_top_margin;
     lv_obj_align(container, LV_ALIGN_TOP_MID, 0, top_margin);
 
-    lv_screen_load_anim(screen, LV_SCREEN_LOAD_ANIM_MOVE_TOP, 300, 0, true);
+    lv_screen_load_anim(
+        screen, right_side ? spec->right_anim_type : spec->left_anim_type,
+        right_side ? spec->right_anim_time : spec->left_anim_time,
+        right_side ? spec->right_anim_delay : spec->left_anim_delay, true
+    );
 }
 
 static void display_screen_spec(const screen_spec_t *spec) {
@@ -667,7 +713,7 @@ static size_t store_shortstring_var(uint8_t index, const char *str) {
     size_t len = strlen(str);
     if (index >= MAX_VAR_INDEX)
         return len;
-        
+
     /* Special-case empty string to avoid consuming pool space */
     variable_value_t *v = &var_table[index];
     if (len == 0) {
@@ -698,8 +744,8 @@ static void handle_hardware_control(uint8_t index, uint8_t value) {
         ESP_LOGI(TAG, "Resetting due to request from HID variable update");
         esp_restart();
     } else if (index == 5) {
-        ESP_LOGW(TAG, "Received unimplemented sleep level update (value %d)", value);
-        /* ignore for now */
+        ESP_LOGW(TAG, "Setting sleep level (value %d)", value);
+        can_turn_displays_off = value > 0;
     } else {
         ESP_LOGW(TAG, "Received hardware control update with unknown index %d (value %d)", index, value);
         /* ignore for now */

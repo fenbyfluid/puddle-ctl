@@ -10,6 +10,8 @@
 #define DISPLAY_COUNT 2
 #define ENCODER_COUNT 4
 
+extern bool can_turn_displays_off;
+
 extern SemaphoreHandle_t lvgl_mutex;
 
 extern lv_display_t *display_handles[DISPLAY_COUNT];

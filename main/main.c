@@ -72,6 +72,8 @@ const gpio_num_t OLED_LEFT_CS_GPIO = 18;
 const gpio_num_t OLED_RIGHT_CS_GPIO = 17;
 const gpio_num_t OLED_RESET_GPIO = 14;
 
+bool can_turn_displays_off = false;
+
 SemaphoreHandle_t lvgl_mutex;
 
 lv_display_t *display_handles[DISPLAY_COUNT] = {NULL};
@@ -316,10 +318,24 @@ void display_task_main(void *pvParameters) {
     ESP_LOGI(TAG, "Display initialization complete, entering LVGL timer loop");
 
     bool contrast_dimmed = false;
+    bool displays_off = false;
 
     for (;;) {
         uint32_t inactive_time = lv_display_get_inactive_time(NULL);
-        if (inactive_time > 30000) {
+        if (inactive_time > 60000 && can_turn_displays_off) {
+            if (!displays_off) {
+                ESP_LOGI(TAG, "Turning off displays due to inactivity");
+                esp_lcd_panel_disp_on_off(lv_display_get_user_data(display_handles[0]), false);
+                esp_lcd_panel_disp_on_off(lv_display_get_user_data(display_handles[1]), false);
+                for (int i = 0; i < ENCODER_COUNT; ++i) {
+                    i2c_encoder_set_led_color(encoder_handles[i], 0, 0, 0);
+                    if (ring_handles[i]) {
+                        is31fl3746a_set_global_scale(ring_handles[i], 0x00);
+                    }
+                }
+                displays_off = true;
+            }
+        } else if (inactive_time > 30000) {
             if (!contrast_dimmed) {
                 ESP_LOGI(TAG, "Dimming display contrast due to inactivity");
                 panel_ssd1322_set_contrast(lv_display_get_user_data(display_handles[0]), 0x10);
@@ -332,6 +348,20 @@ void display_task_main(void *pvParameters) {
                 panel_ssd1322_set_contrast(lv_display_get_user_data(display_handles[0]), 0x9F);
                 panel_ssd1322_set_contrast(lv_display_get_user_data(display_handles[1]), 0x9F);
                 contrast_dimmed = false;
+
+                if (displays_off) {
+                    esp_lcd_panel_disp_on_off(lv_display_get_user_data(display_handles[0]), true);
+                    esp_lcd_panel_disp_on_off(lv_display_get_user_data(display_handles[1]), true);
+
+                    for (int i = 0; i < ENCODER_COUNT; ++i) {
+                        i2c_encoder_set_led_color(encoder_handles[i], 255, 0, 0);
+                        if (ring_handles[i]) {
+                            is31fl3746a_set_global_scale(ring_handles[i], 0x01);
+                        }
+                    }
+
+                    displays_off = false;
+                }
             }
         }
 
